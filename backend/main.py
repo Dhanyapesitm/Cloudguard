@@ -3,23 +3,27 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import sqlite3
 import tempfile
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
+from urllib.parse import quote, urlencode, urlsplit
 
 import bcrypt
 import jwt
+import resend
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, StrictInt
+from resend.exceptions import ResendError
 from verification import VerificationUnavailable, providers_available, verify_recording
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -29,8 +33,11 @@ DATABASE = Path(os.getenv("CLOUDGUARD_DATABASE", str(BASE_DIR / "cloudguard.db")
 JWT_SECRET = os.getenv("CLOUDGUARD_JWT_SECRET")
 FILE_KEY_B64 = os.getenv("CLOUDGUARD_FILE_KEY")
 ENVIRONMENT = os.getenv("CLOUDGUARD_ENV", "development")
+REVIEWER_EMAIL = os.getenv("CLOUDGUARD_REVIEWER_EMAIL", "").strip().lower()
+REVIEWER_PASSWORD_HASH = os.getenv("CLOUDGUARD_REVIEWER_PASSWORD_HASH", "")
 MAX_FILE_BYTES = 25 * 1024 * 1024
 MAX_CHECKIN_BYTES = 20 * 1024 * 1024
+MAX_DEATH_EVIDENCE_BYTES = 10 * 1024 * 1024
 CHECKIN_SENTENCES = {
     "Today I am confirming my CloudGuard check-in.",
     "I am completing my secure digital check-in today.",
@@ -59,6 +66,15 @@ async def lifespan(_: FastAPI):
     if len(JWT_SECRET.encode("utf-8")) < 32:
         raise RuntimeError("CLOUDGUARD_JWT_SECRET must contain at least 32 bytes.")
     encryption_key()
+    if bool(REVIEWER_EMAIL) != bool(REVIEWER_PASSWORD_HASH):
+        raise RuntimeError(
+            "Configure both CLOUDGUARD_REVIEWER_EMAIL and CLOUDGUARD_REVIEWER_PASSWORD_HASH."
+        )
+    if REVIEWER_PASSWORD_HASH:
+        try:
+            bcrypt.checkpw(b"configuration-check", REVIEWER_PASSWORD_HASH.encode("ascii"))
+        except (ValueError, UnicodeEncodeError) as error:
+            raise RuntimeError("CLOUDGUARD_REVIEWER_PASSWORD_HASH must be a bcrypt hash.") from error
     init_database()
     yield
 
@@ -68,7 +84,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("CLOUDGUARD_FRONTEND_ORIGINS", "http://localhost:5173").split(","),
     allow_credentials=False,
-    allow_methods=["GET", "POST", "PATCH", "DELETE"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
     allow_headers=["Authorization", "Content-Type"],
 )
 
@@ -133,6 +149,28 @@ def init_database() -> None:
                 expires_at TEXT NOT NULL,
                 revoked_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS invitations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                email TEXT NOT NULL COLLATE NOCASE,
+                role TEXT NOT NULL CHECK(role IN ('nominee', 'recipient')),
+                target_id INTEGER NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL CHECK(status IN ('pending', 'sent', 'claimed', 'revoked', 'failed')),
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                sent_at TEXT,
+                claimed_at TEXT,
+                revoked_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_invitations_owner_target
+                ON invitations(owner_id, role, target_id, created_at);
+            CREATE TABLE IF NOT EXISTS guest_sessions (
+                id TEXT PRIMARY KEY,
+                invitation_id INTEGER NOT NULL REFERENCES invitations(id) ON DELETE CASCADE,
+                expires_at TEXT NOT NULL,
+                revoked_at TEXT
+            );
             CREATE TABLE IF NOT EXISTS documents (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -150,6 +188,91 @@ def init_database() -> None:
                 name TEXT NOT NULL,
                 email TEXT NOT NULL,
                 relationship TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS document_shares (
+                document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                recipient_id INTEGER NOT NULL REFERENCES recipients(id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (document_id, recipient_id)
+            );
+            CREATE TABLE IF NOT EXISTS recipient_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recipient_id INTEGER NOT NULL UNIQUE REFERENCES recipients(id) ON DELETE CASCADE,
+                password_hash BLOB NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS recipient_sessions (
+                id TEXT PRIMARY KEY,
+                recipient_id INTEGER NOT NULL REFERENCES recipients(id) ON DELETE CASCADE,
+                expires_at TEXT NOT NULL,
+                revoked_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS nominee_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                nominee_id INTEGER NOT NULL UNIQUE REFERENCES nominees(id) ON DELETE CASCADE,
+                password_hash BLOB NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS nominee_sessions (
+                id TEXT PRIMARY KEY,
+                nominee_id INTEGER NOT NULL REFERENCES nominees(id) ON DELETE CASCADE,
+                expires_at TEXT NOT NULL,
+                revoked_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS reviewer_sessions (
+                id TEXT PRIMARY KEY,
+                email TEXT NOT NULL COLLATE NOCASE,
+                expires_at TEXT NOT NULL,
+                revoked_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS death_cases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                nominee_id INTEGER NOT NULL UNIQUE REFERENCES nominees(id) ON DELETE CASCADE,
+                status TEXT NOT NULL CHECK(status IN ('under_review','more_information_required','approved','rejected')),
+                note TEXT NOT NULL DEFAULT '',
+                evidence_ciphertext BLOB NOT NULL,
+                evidence_name TEXT NOT NULL,
+                evidence_type TEXT NOT NULL,
+                evidence_size INTEGER NOT NULL,
+                reviewer_email TEXT,
+                reviewer_message TEXT NOT NULL DEFAULT '',
+                submitted_at TEXT NOT NULL,
+                reviewed_at TEXT,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS nominee_case_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                nominee_id INTEGER NOT NULL REFERENCES nominees(id) ON DELETE CASCADE,
+                owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                case_id INTEGER REFERENCES death_cases(id) ON DELETE SET NULL,
+                event_type TEXT NOT NULL,
+                detail TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS medical_holds (
+                owner_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                status TEXT NOT NULL CHECK(status IN ('active','awaiting_checkin','inactive')),
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS document_releases (
+                document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                recipient_id INTEGER NOT NULL REFERENCES recipients(id) ON DELETE CASCADE,
+                status TEXT NOT NULL CHECK(status IN ('available', 'revoked')),
+                released_at TEXT,
+                revoked_at TEXT,
+                PRIMARY KEY (document_id, recipient_id)
+            );
+            CREATE TABLE IF NOT EXISTS recipient_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recipient_id INTEGER NOT NULL REFERENCES recipients(id) ON DELETE CASCADE,
+                owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                event_type TEXT NOT NULL,
+                document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
+                detail TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS nominees (
@@ -248,6 +371,527 @@ class ProfilePayload(BaseModel):
     checkin_interval: int = Field(ge=7, le=365)
 
 
+class CreateInvitationPayload(BaseModel):
+    role: Literal["nominee", "recipient"]
+    target_id: StrictInt = Field(gt=0)
+
+
+class ClaimInvitationPayload(BaseModel):
+    token: str = Field(min_length=43, max_length=256)
+    password: Optional[str] = Field(default=None, min_length=10, max_length=72)
+
+
+class ReleasePayload(BaseModel):
+    recipient_id: StrictInt = Field(gt=0)
+
+class MedicalHoldPayload(BaseModel):
+    action: Literal["start", "end"]
+
+class DeathCaseReviewPayload(BaseModel):
+    decision: Literal["more_information_required", "approved", "rejected"]
+    message: str = Field(min_length=5, max_length=2000)
+
+
+def invitation_target(
+    connection: sqlite3.Connection, owner_id: int, role: str, target_id: int
+) -> sqlite3.Row:
+    if role == "nominee":
+        target = connection.execute(
+            "SELECT id,name,email FROM nominees WHERE id=? AND owner_id=?",
+            (target_id, owner_id),
+        ).fetchone()
+    elif role == "recipient":
+        target = connection.execute(
+            "SELECT id,name,email FROM recipients WHERE id=? AND owner_id=?",
+            (target_id, owner_id),
+        ).fetchone()
+    else:
+        raise HTTPException(status_code=422, detail="Invitation role is invalid.")
+    if target is None:
+        raise HTTPException(status_code=404, detail="The selected contact was not found.")
+    return target
+
+
+def revoke_target_invitations(
+    connection: sqlite3.Connection,
+    owner_id: int,
+    role: str,
+    target_id: int,
+    exclude_invitation_id: Optional[int] = None,
+) -> None:
+    now = utc_now().isoformat()
+    exclude_clause = " AND id<>?" if exclude_invitation_id is not None else ""
+    parameters = [now, owner_id, role, target_id]
+    if exclude_invitation_id is not None:
+        parameters.append(exclude_invitation_id)
+    updated = connection.execute(
+        """UPDATE invitations SET status='revoked',revoked_at=?
+           WHERE owner_id=? AND role=? AND target_id=?
+             AND status IN ('pending','sent','claimed')""" + exclude_clause,
+        parameters,
+    )
+    if updated.rowcount:
+        audit(connection, owner_id, f"invitation.access_revoked:{role}:{target_id}")
+    connection.execute(
+        """UPDATE guest_sessions SET revoked_at=?
+           WHERE revoked_at IS NULL AND invitation_id IN (
+               SELECT id FROM invitations
+               WHERE owner_id=? AND role=? AND target_id=? AND status='revoked'
+           )""",
+        (now, owner_id, role, target_id),
+    )
+    if role == "recipient":
+        connection.execute(
+            "UPDATE recipient_sessions SET revoked_at=? WHERE recipient_id=? AND revoked_at IS NULL",
+            (now, target_id),
+        )
+    elif role == "nominee":
+        connection.execute(
+            "UPDATE nominee_sessions SET revoked_at=? WHERE nominee_id=? AND revoked_at IS NULL",
+            (now, target_id),
+        )
+
+
+def _password_hash(password: str) -> bytes:
+    if len(password.encode("utf-8")) > 72:
+        raise HTTPException(status_code=422, detail="Password must be 72 bytes or fewer.")
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt())
+
+
+def _log_recipient_event(
+    connection: sqlite3.Connection,
+    recipient_id: int,
+    owner_id: int,
+    event_type: str,
+    document_id: Optional[int] = None,
+    detail: str = "",
+) -> None:
+    connection.execute(
+        """INSERT INTO recipient_events(recipient_id,owner_id,event_type,document_id,detail,created_at)
+           VALUES(?,?,?,?,?,?)""",
+        (recipient_id, owner_id, event_type, document_id, detail, utc_now().isoformat()),
+    )
+
+
+def _medical_hold_state(connection: sqlite3.Connection, owner_id: int) -> dict:
+    row = connection.execute(
+        "SELECT status,started_at,ended_at,updated_at FROM medical_holds WHERE owner_id=?",
+        (owner_id,),
+    ).fetchone()
+    return dict(row) if row else {
+        "status": "inactive",
+        "started_at": None,
+        "ended_at": None,
+        "updated_at": None,
+    }
+
+
+def _set_document_release(
+    connection: sqlite3.Connection, document_id: int, recipient_id: int, status: str
+) -> None:
+    now = utc_now().isoformat()
+    existing = connection.execute(
+        "SELECT status FROM document_releases WHERE document_id=? AND recipient_id=?",
+        (document_id, recipient_id),
+    ).fetchone()
+    if existing:
+        if status == "available":
+            connection.execute(
+                """UPDATE document_releases SET status='available', released_at=?, revoked_at=NULL
+                   WHERE document_id=? AND recipient_id=?""",
+                (now, document_id, recipient_id),
+            )
+        else:
+            connection.execute(
+                """UPDATE document_releases SET status='revoked', revoked_at=?
+                   WHERE document_id=? AND recipient_id=?""",
+                (now, document_id, recipient_id),
+            )
+        return
+    connection.execute(
+        """INSERT INTO document_releases(document_id,recipient_id,status,released_at,revoked_at)
+           VALUES(?,?,?,?,?)""",
+        (
+            document_id,
+            recipient_id,
+            status,
+            now if status == "available" else None,
+            now if status == "revoked" else None,
+        ),
+    )
+
+
+def _replace_document_shares(
+    connection: sqlite3.Connection,
+    owner_id: int,
+    document_id: int,
+    recipient_ids: list[int],
+) -> None:
+    current = {
+        row["recipient_id"]
+        for row in connection.execute(
+            "SELECT recipient_id FROM document_shares WHERE document_id=?",
+            (document_id,),
+        )
+    }
+    new_ids = list(dict.fromkeys(recipient_ids))
+    new_set = set(new_ids)
+    for recipient_id in current - new_set:
+        _set_document_release(connection, document_id, recipient_id, "revoked")
+        _log_recipient_event(
+            connection,
+            recipient_id,
+            owner_id,
+            "access_revoked",
+            document_id,
+            "The owner removed this document assignment.",
+        )
+    connection.execute("DELETE FROM document_shares WHERE document_id=?", (document_id,))
+    now = utc_now().isoformat()
+    for recipient_id in new_ids:
+        connection.execute(
+            "INSERT INTO document_shares(document_id,recipient_id,created_at) VALUES(?,?,?)",
+            (document_id, recipient_id, now),
+        )
+        if recipient_id not in current:
+            connection.execute(
+                "DELETE FROM document_releases WHERE document_id=? AND recipient_id=?",
+                (document_id, recipient_id),
+            )
+            _log_recipient_event(
+                connection,
+                recipient_id,
+                owner_id,
+                "assignment_pending",
+                document_id,
+                "A document was assigned. Access stays locked until the owner approves release.",
+            )
+
+
+def _recipient_documents(connection: sqlite3.Connection, recipient_id: int) -> list[dict]:
+    owner = connection.execute(
+        "SELECT owner_id FROM recipients WHERE id=?", (recipient_id,)
+    ).fetchone()
+    if owner is None:
+        return []
+    owner_id = owner["owner_id"]
+    hold = _medical_hold_state(connection, owner_id)
+    has_approved_case = connection.execute(
+        "SELECT 1 FROM death_cases WHERE owner_id=? AND status='approved'",
+        (owner_id,),
+    ).fetchone() is not None
+    shares = connection.execute(
+        """SELECT documents.id, documents.name, documents.category, documents.file_name,
+                  documents.content_type, documents.file_size, documents.created_at,
+                  document_shares.created_at AS assigned_at
+           FROM document_shares
+           JOIN documents ON documents.id = document_shares.document_id
+           WHERE document_shares.recipient_id=?""",
+        (recipient_id,),
+    ).fetchall()
+    releases = {
+        row["document_id"]: dict(row)
+        for row in connection.execute(
+            """SELECT document_id,status,released_at,revoked_at
+               FROM document_releases WHERE recipient_id=?""",
+            (recipient_id,),
+        )
+    }
+    documents = {}
+    for row in shares:
+        release = releases.get(row["id"])
+        if release and release["status"] == "revoked":
+            access_status = "revoked"
+        elif (
+            release
+            and release["status"] == "available"
+            and hold["status"] == "inactive"
+            and has_approved_case
+        ):
+            access_status = "available"
+        else:
+            access_status = "pending"
+        documents[row["id"]] = {
+            **dict(row),
+            "access_status": access_status,
+            "released_at": release["released_at"] if release else None,
+            "revoked_at": release["revoked_at"] if release else None,
+            "release_hold": hold["status"] != "inactive",
+            "case_approved": has_approved_case,
+        }
+    for document_id, release in releases.items():
+        if document_id in documents or release["status"] != "revoked":
+            continue
+        document = connection.execute(
+            """SELECT id,name,category,file_name,content_type,file_size,created_at
+               FROM documents WHERE id=?""",
+            (document_id,),
+        ).fetchone()
+        if document is None:
+            continue
+        documents[document_id] = {
+            **dict(document),
+            "assigned_at": None,
+            "access_status": "revoked",
+            "released_at": release["released_at"],
+            "revoked_at": release["revoked_at"],
+            "release_hold": hold["status"] != "inactive",
+            "case_approved": has_approved_case,
+        }
+    return sorted(documents.values(), key=lambda item: item["id"], reverse=True)
+
+
+def _issue_recipient_session(recipient_id: int, email: str) -> tuple[str, datetime]:
+    now = utc_now()
+    expires_at = now + timedelta(hours=12)
+    session_id = secrets.token_urlsafe(24)
+    with db() as connection:
+        connection.execute(
+            "INSERT INTO recipient_sessions(id,recipient_id,expires_at) VALUES(?,?,?)",
+            (session_id, recipient_id, expires_at.isoformat()),
+        )
+    token = jwt.encode(
+        {
+            "sub": email,
+            "jti": session_id,
+            "iat": now,
+            "exp": expires_at,
+            "principal_type": "recipient",
+            "recipient_id": recipient_id,
+        },
+        JWT_SECRET,
+        algorithm="HS256",
+    )
+    return token, expires_at
+
+
+def _issue_nominee_session(nominee_id: int, email: str) -> tuple[str, datetime]:
+    now = utc_now()
+    expires_at = now + timedelta(hours=12)
+    session_id = secrets.token_urlsafe(24)
+    with db() as connection:
+        connection.execute(
+            "INSERT INTO nominee_sessions(id,nominee_id,expires_at) VALUES(?,?,?)",
+            (session_id, nominee_id, expires_at.isoformat()),
+        )
+    token = jwt.encode(
+        {
+            "sub": email,
+            "jti": session_id,
+            "iat": now,
+            "exp": expires_at,
+            "principal_type": "nominee",
+            "nominee_id": nominee_id,
+        },
+        JWT_SECRET,
+        algorithm="HS256",
+    )
+    return token, expires_at
+
+
+def _issue_reviewer_session(email: str) -> tuple[str, datetime]:
+    now = utc_now()
+    expires_at = now + timedelta(hours=8)
+    session_id = secrets.token_urlsafe(24)
+    with db() as connection:
+        connection.execute(
+            "INSERT INTO reviewer_sessions(id,email,expires_at) VALUES(?,?,?)",
+            (session_id, email, expires_at.isoformat()),
+        )
+    token = jwt.encode(
+        {
+            "sub": email,
+            "jti": session_id,
+            "iat": now,
+            "exp": expires_at,
+            "principal_type": "reviewer",
+        },
+        JWT_SECRET,
+        algorithm="HS256",
+    )
+    return token, expires_at
+
+
+def recipient_principal(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+) -> dict:
+    if not credentials:
+        raise HTTPException(status_code=401, detail="A valid recipient sign-in is required.")
+    try:
+        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=["HS256"])
+        if payload.get("principal_type") != "recipient":
+            raise HTTPException(status_code=401, detail="A valid recipient sign-in is required.")
+        session_id = payload["jti"]
+        recipient_id = int(payload["recipient_id"])
+        email = str(payload["sub"]).strip().lower()
+    except HTTPException:
+        raise
+    except (jwt.InvalidTokenError, KeyError, TypeError, ValueError) as error:
+        raise HTTPException(status_code=401, detail="The recipient sign-in has expired.") from error
+
+    with db() as connection:
+        row = connection.execute(
+            """SELECT recipient_sessions.id, recipient_sessions.expires_at, recipient_sessions.revoked_at,
+                      recipients.id AS recipient_id, recipients.name, recipients.email, recipients.owner_id,
+                      users.name AS owner_name
+               FROM recipient_sessions
+               JOIN recipients ON recipients.id = recipient_sessions.recipient_id
+               JOIN users ON users.id = recipients.owner_id
+               WHERE recipient_sessions.id=? AND recipients.id=?""",
+            (session_id, recipient_id),
+        ).fetchone()
+        if (
+            row is None
+            or row["revoked_at"] is not None
+            or row["email"].strip().lower() != email
+            or datetime.fromisoformat(row["expires_at"]) <= utc_now()
+        ):
+            raise HTTPException(status_code=401, detail="The recipient sign-in is no longer active.")
+        return {
+            "email": email,
+            "name": row["name"],
+            "role": "recipient",
+            "owner_id": row["owner_id"],
+            "owner_name": row["owner_name"],
+            "recipient_id": row["recipient_id"],
+            "session_id": row["id"],
+        }
+
+
+def nominee_principal(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+) -> dict:
+    if not credentials:
+        raise HTTPException(status_code=401, detail="A valid nominee sign-in is required.")
+    try:
+        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=["HS256"])
+        if payload.get("principal_type") != "nominee":
+            raise HTTPException(status_code=401, detail="A valid nominee sign-in is required.")
+        session_id = payload["jti"]
+        nominee_id = int(payload["nominee_id"])
+        email = str(payload["sub"]).strip().lower()
+    except HTTPException:
+        raise
+    except (jwt.InvalidTokenError, KeyError, TypeError, ValueError) as error:
+        raise HTTPException(status_code=401, detail="The nominee sign-in has expired.") from error
+
+    with db() as connection:
+        row = connection.execute(
+            """SELECT nominee_sessions.id,nominee_sessions.expires_at,nominee_sessions.revoked_at,
+                      nominees.id AS nominee_id,nominees.name,nominees.email,nominees.owner_id,
+                      users.name AS owner_name
+               FROM nominee_sessions
+               JOIN nominees ON nominees.id=nominee_sessions.nominee_id
+               JOIN users ON users.id=nominees.owner_id
+               WHERE nominee_sessions.id=? AND nominees.id=?""",
+            (session_id, nominee_id),
+        ).fetchone()
+        if (
+            row is None
+            or row["revoked_at"] is not None
+            or row["email"].strip().lower() != email
+            or datetime.fromisoformat(row["expires_at"]) <= utc_now()
+        ):
+            raise HTTPException(status_code=401, detail="The nominee sign-in is no longer active.")
+        return {
+            "email": email,
+            "name": row["name"],
+            "role": "nominee",
+            "owner_id": row["owner_id"],
+            "owner_name": row["owner_name"],
+            "nominee_id": row["nominee_id"],
+            "session_id": row["id"],
+        }
+
+
+def reviewer_principal(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+) -> dict:
+    if not credentials:
+        raise HTTPException(status_code=401, detail="A valid reviewer sign-in is required.")
+    try:
+        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=["HS256"])
+        if payload.get("principal_type") != "reviewer":
+            raise HTTPException(status_code=401, detail="A valid reviewer sign-in is required.")
+        session_id = payload["jti"]
+        email = str(payload["sub"]).strip().lower()
+    except HTTPException:
+        raise
+    except (jwt.InvalidTokenError, KeyError, TypeError, ValueError) as error:
+        raise HTTPException(status_code=401, detail="The reviewer sign-in has expired.") from error
+    with db() as connection:
+        row = connection.execute(
+            "SELECT id,expires_at,revoked_at,email FROM reviewer_sessions WHERE id=?",
+            (session_id,),
+        ).fetchone()
+    if (
+        row is None
+        or row["revoked_at"] is not None
+        or row["email"].strip().lower() != email
+        or email != REVIEWER_EMAIL
+        or datetime.fromisoformat(row["expires_at"]) <= utc_now()
+    ):
+        raise HTTPException(status_code=401, detail="The reviewer sign-in is no longer active.")
+    return {"email": email, "session_id": row["id"], "role": "reviewer"}
+
+
+def guest_principal(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+) -> dict:
+    if not credentials:
+        raise HTTPException(status_code=401, detail="A valid invitation sign-in is required.")
+    try:
+        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=["HS256"])
+        if payload.get("principal_type") != "guest":
+            raise HTTPException(status_code=401, detail="A valid invitation sign-in is required.")
+        session_id = payload["jti"]
+        invitation_id = int(payload["invitation_id"])
+        email = str(payload["sub"]).strip().lower()
+    except HTTPException:
+        raise
+    except (jwt.InvalidTokenError, KeyError, TypeError, ValueError) as error:
+        raise HTTPException(status_code=401, detail="The invitation sign-in has expired.") from error
+
+    with db() as connection:
+        row = connection.execute(
+            """SELECT guest_sessions.id,guest_sessions.expires_at AS session_expires_at,
+                      guest_sessions.revoked_at AS session_revoked_at,
+                      invitations.id AS invitation_id,invitations.owner_id,
+                      invitations.email,invitations.role,invitations.target_id,
+                      invitations.status,invitations.revoked_at AS invitation_revoked_at,
+                      users.name AS owner_name
+               FROM guest_sessions
+               JOIN invitations ON invitations.id=guest_sessions.invitation_id
+               JOIN users ON users.id=invitations.owner_id
+               WHERE guest_sessions.id=? AND invitations.id=?""",
+            (session_id, invitation_id),
+        ).fetchone()
+        if (
+            row is None
+            or row["session_revoked_at"] is not None
+            or row["invitation_revoked_at"] is not None
+            or row["status"] != "claimed"
+            or row["email"].strip().lower() != email
+            or datetime.fromisoformat(row["session_expires_at"]) <= utc_now()
+        ):
+            raise HTTPException(status_code=401, detail="The invitation sign-in is no longer active.")
+        try:
+            target = invitation_target(connection, row["owner_id"], row["role"], row["target_id"])
+        except HTTPException as error:
+            raise HTTPException(status_code=401, detail="The invitation sign-in is no longer active.") from error
+        if target["email"].strip().lower() != email:
+            raise HTTPException(status_code=401, detail="The invitation sign-in is no longer active.")
+        return {
+            "email": email,
+            "role": row["role"],
+            "owner_id": row["owner_id"],
+            "owner_name": row["owner_name"],
+            "target_id": row["target_id"],
+            "invitation_id": row["invitation_id"],
+            "session_id": row["id"],
+        }
+
+
 def issue_token(user_id: int) -> str:
     now = utc_now()
     expires_at = now + timedelta(hours=12)
@@ -258,7 +902,13 @@ def issue_token(user_id: int) -> str:
             (session_id, user_id, expires_at.isoformat()),
         )
     return jwt.encode(
-        {"sub": str(user_id), "jti": session_id, "iat": now, "exp": expires_at},
+        {
+            "sub": str(user_id),
+            "jti": session_id,
+            "iat": now,
+            "exp": expires_at,
+            "principal_type": "owner",
+        },
         JWT_SECRET,
         algorithm="HS256",
     )
@@ -271,8 +921,12 @@ def current_user(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Please sign in to continue.")
     try:
         payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=["HS256"])
+        if payload.get("principal_type", "owner") != "owner":
+            raise HTTPException(status_code=401, detail="Owner sign-in is required.")
         user_id = int(payload["sub"])
         session_id = payload["jti"]
+    except HTTPException:
+        raise
     except (jwt.InvalidTokenError, KeyError, ValueError) as error:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Your session has expired. Please sign in again.") from error
     with db() as connection:
@@ -294,6 +948,992 @@ def health() -> dict:
         "verification_mode": "local" if configured else "unavailable",
         "ai_verification_configured": configured,
     }
+
+
+def send_invitation_email(email: str, role: str, token: str) -> str:
+    config, missing = invitation_email_configuration()
+    if missing:
+        raise RuntimeError(
+            f"Invitation email configuration is missing: {', '.join(missing)}."
+        )
+    api_key = config["RESEND_API_KEY"]
+    sender = config["RESEND_FROM_EMAIL"]
+    app_url = config["CLOUDGUARD_APP_URL"].rstrip("/")
+    parsed_url = urlsplit(app_url)
+    if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc or parsed_url.query or parsed_url.fragment:
+        raise RuntimeError("Invitation app URL configuration is invalid.")
+
+    resend.api_key = api_key
+    claim_url = f"{app_url}/#guest-invitation={token}"
+    role_label = "Trusted Nominee" if role == "nominee" else "Authorized Recipient"
+    response = resend.Emails.send(
+        {
+            "from": sender,
+            "to": [email],
+            "subject": "You have been invited to CloudGuard",
+            "text": (
+                f"You have been invited to CloudGuard as a {role_label}.\n\n"
+                "Open this secure, single-use link within 7 days to verify this email address"
+                + (
+                    f" and create a password for your {role} account:\n"
+                    if role in {"recipient", "nominee"}
+                    else ":\n"
+                )
+                + f"{claim_url}\n\n"
+                "Accepting this invitation does not grant access to documents. "
+                "Assigned files stay locked until the owner completes and approves release. "
+                "Missed owner check-ins never release documents automatically."
+            ),
+        }
+    )
+    provider_id = response.get("id") if isinstance(response, dict) else None
+    if not isinstance(provider_id, str) or not provider_id:
+        raise RuntimeError("Resend did not confirm acceptance of the invitation email.")
+    return provider_id
+
+
+def invitation_email_configuration() -> tuple[dict[str, str], list[str]]:
+    file_values = dotenv_values(BASE_DIR / ".env")
+    config = {}
+    missing = []
+    for name in ("RESEND_API_KEY", "RESEND_FROM_EMAIL", "CLOUDGUARD_APP_URL"):
+        value = os.getenv(name)
+        if not value or not value.strip():
+            value = file_values.get(name)
+        if not isinstance(value, str) or not value.strip():
+            missing.append(name)
+        else:
+            config[name] = value.strip()
+    return config, missing
+
+
+def sanitized_resend_error(error: ResendError, secrets_to_redact: list[str]) -> str:
+    message = str(getattr(error, "message", "")) or "No provider message was supplied."
+    for secret in secrets_to_redact:
+        if secret:
+            message = message.replace(secret, "[redacted]")
+    message = re.sub(
+        r"(?i)authorization\s*[:=]\s*(?:Bearer\s+)?\S+",
+        "Authorization: [redacted]",
+        message,
+    )
+    message = re.sub(r"(?i)\bBearer\s+\S+", "Bearer [redacted]", message)
+    message = re.sub(r"(?i)\b(?:re|rk|sk)_[A-Za-z0-9_-]+\b", "[redacted]", message)
+    message = re.sub(
+        r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
+        "[email redacted]",
+        message,
+        flags=re.IGNORECASE,
+    )
+    message = " ".join(message.split())[:300]
+    error_type = re.sub(
+        r"[^A-Za-z0-9_.-]", "", str(getattr(error, "error_type", "ResendError"))
+    )[:80] or "ResendError"
+    status_code = re.sub(r"[^0-9]", "", str(getattr(error, "code", "")))[:3]
+    status_text = f"HTTP {status_code}" if status_code else "status unavailable"
+    return f"Resend rejected the invitation ({status_text}, {error_type}): {message}"
+
+
+@app.post("/api/invitations", status_code=201)
+def create_invitation(
+    payload: CreateInvitationPayload,
+    user: sqlite3.Row = Depends(current_user),
+) -> dict:
+    """Create a single-use invitation only when the email provider accepts it."""
+    config, missing = invitation_email_configuration()
+    if missing:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Invitation email configuration is missing: {', '.join(missing)}.",
+        )
+    invitation_token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(invitation_token.encode("ascii")).hexdigest()
+    now = utc_now()
+    expires_at = now + timedelta(days=7)
+    app_url = config["CLOUDGUARD_APP_URL"].rstrip("/")
+    claim_url = f"{app_url}/#guest-invitation={invitation_token}"
+
+    with db() as connection:
+        target = invitation_target(connection, user["id"], payload.role, payload.target_id)
+        email = target["email"].strip().lower()
+        cursor = connection.execute(
+            """INSERT INTO invitations(owner_id,email,role,target_id,token_hash,status,created_at,expires_at)
+               VALUES(?,?,?,?,?,'pending',?,?)""",
+            (
+                user["id"],
+                email,
+                payload.role,
+                payload.target_id,
+                token_hash,
+                now.isoformat(),
+                expires_at.isoformat(),
+            ),
+        )
+        invitation_id = cursor.lastrowid
+        audit(connection, user["id"], f"invitation.created:{invitation_id}:{payload.role}")
+
+    try:
+        send_invitation_email(email, payload.role, invitation_token)
+    except ResendError as error:
+        safe_detail = sanitized_resend_error(
+            error,
+            [invitation_token, email, config["RESEND_API_KEY"]],
+        )
+        with db() as connection:
+            connection.execute(
+                "UPDATE invitations SET status='failed' WHERE id=? AND status='pending'",
+                (invitation_id,),
+            )
+            audit(connection, user["id"], f"invitation.email_failed:{invitation_id}:{payload.role}")
+        logger.warning("Invitation %s email failed: %s", invitation_id, safe_detail)
+        raise HTTPException(status_code=502, detail=safe_detail) from error
+    except Exception as error:
+        with db() as connection:
+            connection.execute(
+                "UPDATE invitations SET status='failed' WHERE id=? AND status='pending'",
+                (invitation_id,),
+            )
+            audit(connection, user["id"], f"invitation.email_failed:{invitation_id}:{payload.role}")
+        logger.exception("Invitation %s email delivery failed.", invitation_id)
+        raise HTTPException(
+            status_code=502,
+            detail="The invitation email could not be sent. Check the API log and email configuration before retrying.",
+        ) from error
+
+    with db() as connection:
+        revoke_target_invitations(
+            connection,
+            user["id"],
+            payload.role,
+            payload.target_id,
+            exclude_invitation_id=invitation_id,
+        )
+        cursor = connection.execute(
+            """UPDATE invitations SET status='sent',sent_at=?
+               WHERE id=? AND status='pending' AND expires_at>?""",
+            (utc_now().isoformat(), invitation_id, utc_now().isoformat()),
+        )
+        if cursor.rowcount != 1:
+            raise HTTPException(
+                status_code=503,
+                detail="The invitation could not be activated. Please try again.",
+            )
+        audit(
+            connection,
+            user["id"],
+            f"invitation.sent:{invitation_id}:{payload.role}",
+        )
+
+    return {
+        "invitation": {
+            "id": invitation_id,
+            "email": email,
+            "role": payload.role,
+            "status": "sent",
+            "expires_at": expires_at.isoformat(),
+            "claim_url": claim_url,
+        },
+        "claim_url": claim_url,
+        "message": "Invitation email sent. The recipient can use the single-use link to create their account.",
+    }
+
+@app.get("/api/invitations")
+def list_invitations(user: sqlite3.Row = Depends(current_user)) -> dict:
+    with db() as connection:
+        rows = connection.execute(
+            """SELECT id,email,role,target_id,status,created_at,expires_at,sent_at,claimed_at,revoked_at
+               FROM invitations WHERE owner_id=? ORDER BY id DESC LIMIT 100""",
+            (user["id"],),
+        ).fetchall()
+    invitations = []
+    for row in rows:
+        item = dict(row)
+        if item["status"] == "sent" and datetime.fromisoformat(item["expires_at"]) <= utc_now():
+            item["status"] = "expired"
+        invitations.append(item)
+    return {"invitations": invitations}
+
+
+@app.delete("/api/invitations/{invitation_id}", status_code=204)
+def revoke_invitation(invitation_id: int, user: sqlite3.Row = Depends(current_user)) -> None:
+    now = utc_now().isoformat()
+    with db() as connection:
+        invitation = connection.execute(
+            "SELECT id,role,target_id FROM invitations WHERE id=? AND owner_id=?",
+            (invitation_id, user["id"]),
+        ).fetchone()
+        if invitation is None:
+            raise HTTPException(status_code=404, detail="Invitation was not found.")
+        connection.execute(
+            """UPDATE invitations SET status='revoked',revoked_at=?
+               WHERE id=? AND status IN ('pending','sent','claimed')""",
+            (now, invitation_id),
+        )
+        connection.execute(
+            "UPDATE guest_sessions SET revoked_at=? WHERE invitation_id=? AND revoked_at IS NULL",
+            (now, invitation_id),
+        )
+        if invitation["role"] == "recipient":
+            connection.execute(
+                "UPDATE recipient_sessions SET revoked_at=? WHERE recipient_id=? AND revoked_at IS NULL",
+                (now, invitation["target_id"]),
+            )
+        elif invitation["role"] == "nominee":
+            connection.execute(
+                "UPDATE nominee_sessions SET revoked_at=? WHERE nominee_id=? AND revoked_at IS NULL",
+                (now, invitation["target_id"]),
+            )
+        audit(connection, user["id"], f"invitation.revoked:{invitation_id}:{invitation['role']}")
+
+
+@app.get("/api/guest/invitations/preview")
+def preview_invitation(token: str) -> dict:
+    if not token or len(token) < 43:
+        raise HTTPException(status_code=400, detail="This invitation is invalid, expired, or already used.")
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    now = utc_now()
+    with db() as connection:
+        invitation = connection.execute(
+            """SELECT owner_id,email,role,target_id,expires_at,status,revoked_at
+               FROM invitations WHERE token_hash=?""",
+            (token_hash,),
+        ).fetchone()
+        if (
+            invitation is None
+            or invitation["status"] != "sent"
+            or invitation["revoked_at"] is not None
+            or datetime.fromisoformat(invitation["expires_at"]) <= now
+        ):
+            raise HTTPException(status_code=400, detail="This invitation is invalid, expired, or already used.")
+        try:
+            invitation_target(connection, invitation["owner_id"], invitation["role"], invitation["target_id"])
+        except HTTPException as error:
+            raise HTTPException(status_code=400, detail="This invitation is no longer valid.") from error
+        owner = connection.execute("SELECT name FROM users WHERE id=?", (invitation["owner_id"],)).fetchone()
+    email = invitation["email"].strip().lower()
+    local, _, domain = email.partition("@")
+    hint = f"{local[:1]}***@{domain}" if domain else "***"
+    return {
+        "role": invitation["role"],
+        "owner_name": owner["name"] if owner else "CloudGuard owner",
+        "email_hint": hint,
+        "requires_password": invitation["role"] in {"recipient", "nominee"},
+    }
+
+
+@app.post("/api/guest/invitations/claim")
+def claim_invitation(payload: ClaimInvitationPayload) -> dict:
+    token_hash = hashlib.sha256(payload.token.encode("utf-8")).hexdigest()
+    now = utc_now()
+    session_id = secrets.token_urlsafe(24)
+    with db() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        invitation = connection.execute(
+            """SELECT id,owner_id,email,role,target_id,expires_at,status,revoked_at
+               FROM invitations WHERE token_hash=?""",
+            (token_hash,),
+        ).fetchone()
+        if (
+            invitation is None
+            or invitation["status"] != "sent"
+            or invitation["revoked_at"] is not None
+            or datetime.fromisoformat(invitation["expires_at"]) <= now
+        ):
+            raise HTTPException(status_code=400, detail="This invitation is invalid, expired, or already used.")
+        try:
+            target = invitation_target(
+                connection,
+                invitation["owner_id"],
+                invitation["role"],
+                invitation["target_id"],
+            )
+        except HTTPException as error:
+            raise HTTPException(status_code=400, detail="This invitation is no longer valid.") from error
+        email = invitation["email"].strip().lower()
+        if target["email"].strip().lower() != email:
+            raise HTTPException(status_code=400, detail="This invitation is no longer valid.")
+        if invitation["role"] in {"recipient", "nominee"} and not payload.password:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Create a password of at least 10 characters to finish setting up your {invitation['role']} account.",
+            )
+
+        session_expires_at = min(now + timedelta(hours=12), datetime.fromisoformat(invitation["expires_at"]))
+        updated = connection.execute(
+            """UPDATE invitations SET status='claimed',claimed_at=?
+               WHERE id=? AND status='sent' AND revoked_at IS NULL""",
+            (now.isoformat(), invitation["id"]),
+        )
+        if updated.rowcount != 1:
+            raise HTTPException(status_code=400, detail="This invitation is invalid, expired, or already used.")
+        owner = connection.execute(
+            "SELECT name FROM users WHERE id=?", (invitation["owner_id"],)
+        ).fetchone()
+        audit(connection, invitation["owner_id"], f"invitation.claimed:{invitation['id']}:{invitation['role']}")
+
+        if invitation["role"] == "recipient":
+            password_hash = _password_hash(payload.password)
+            connection.execute(
+                """INSERT INTO recipient_accounts(recipient_id,password_hash,created_at)
+                   VALUES(?,?,?)
+                   ON CONFLICT(recipient_id) DO UPDATE SET password_hash=excluded.password_hash""",
+                (invitation["target_id"], password_hash, now.isoformat()),
+            )
+            connection.execute(
+                "INSERT INTO recipient_sessions(id,recipient_id,expires_at) VALUES(?,?,?)",
+                (session_id, invitation["target_id"], session_expires_at.isoformat()),
+            )
+            _log_recipient_event(
+                connection,
+                invitation["target_id"],
+                invitation["owner_id"],
+                "invitation_confirmed",
+                None,
+                "Email verified and recipient account created. Document access remains locked until the owner approves release.",
+            )
+            recipient_payload = {
+                "email": email,
+                "name": target["name"],
+                "role": "recipient",
+                "owner_name": owner["name"],
+            }
+        elif invitation["role"] == "nominee":
+            password_hash = _password_hash(payload.password)
+            connection.execute(
+                """INSERT INTO nominee_accounts(nominee_id,password_hash,created_at)
+                   VALUES(?,?,?)
+                   ON CONFLICT(nominee_id) DO UPDATE SET password_hash=excluded.password_hash""",
+                (invitation["target_id"], password_hash, now.isoformat()),
+            )
+            connection.execute(
+                "INSERT INTO nominee_sessions(id,nominee_id,expires_at) VALUES(?,?,?)",
+                (session_id, invitation["target_id"], session_expires_at.isoformat()),
+            )
+            connection.execute(
+                """INSERT INTO nominee_case_events(nominee_id,owner_id,event_type,detail,created_at)
+                   VALUES(?,?,?,?,?)""",
+                (
+                    invitation["target_id"],
+                    invitation["owner_id"],
+                    "invitation_confirmed",
+                    "Invitation verified and nominee account created.",
+                    now.isoformat(),
+                ),
+            )
+            nominee_payload = {
+                "email": email,
+                "name": target["name"],
+                "role": "nominee",
+                "owner_name": owner["name"],
+            }
+        else:
+            connection.execute(
+                "INSERT INTO guest_sessions(id,invitation_id,expires_at) VALUES(?,?,?)",
+                (session_id, invitation["id"], session_expires_at.isoformat()),
+            )
+            recipient_payload = None
+
+    if invitation["role"] == "recipient":
+        access_token = jwt.encode(
+            {
+                "sub": email,
+                "jti": session_id,
+                "iat": now,
+                "exp": session_expires_at,
+                "principal_type": "recipient",
+                "recipient_id": invitation["target_id"],
+            },
+            JWT_SECRET,
+            algorithm="HS256",
+        )
+        return {
+            "access_token": access_token,
+            "token_type": "bearer",
+            "principal_type": "recipient",
+            "recipient": recipient_payload,
+        }
+
+    if invitation["role"] == "nominee":
+        access_token = jwt.encode(
+            {
+                "sub": email,
+                "jti": session_id,
+                "iat": now,
+                "exp": session_expires_at,
+                "principal_type": "nominee",
+                "nominee_id": invitation["target_id"],
+            },
+            JWT_SECRET,
+            algorithm="HS256",
+        )
+        return {
+            "access_token": access_token,
+            "token_type": "bearer",
+            "principal_type": "nominee",
+            "nominee": nominee_payload,
+        }
+
+    access_token = jwt.encode(
+        {
+            "sub": email,
+            "jti": session_id,
+            "iat": now,
+            "exp": session_expires_at,
+            "principal_type": "guest",
+            "invitation_id": invitation["id"],
+        },
+        JWT_SECRET,
+        algorithm="HS256",
+    )
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "principal_type": "guest",
+        "guest": {
+            "email": email,
+            "role": invitation["role"],
+            "owner_name": owner["name"],
+        },
+    }
+
+
+@app.get("/api/guest/me")
+def guest_me(guest: dict = Depends(guest_principal)) -> dict:
+    return {"guest": guest}
+
+
+@app.post("/api/guest/logout", status_code=204)
+def guest_logout(guest: dict = Depends(guest_principal)) -> None:
+    with db() as connection:
+        connection.execute(
+            "UPDATE guest_sessions SET revoked_at=? WHERE id=? AND revoked_at IS NULL",
+            (utc_now().isoformat(), guest["session_id"]),
+        )
+        audit(connection, guest["owner_id"], f"invitation.guest_signed_out:{guest['invitation_id']}")
+
+
+@app.post("/api/recipient/login")
+def recipient_login(payload: LoginPayload) -> dict:
+    email = payload.email.strip().lower()
+    with db() as connection:
+        rows = connection.execute(
+            """SELECT recipient_accounts.password_hash, recipients.id, recipients.name,
+                      recipients.email, users.name AS owner_name
+               FROM recipient_accounts
+               JOIN recipients ON recipients.id = recipient_accounts.recipient_id
+               JOIN users ON users.id = recipients.owner_id
+               WHERE recipients.email=?""",
+            (email,),
+        ).fetchall()
+    matched = None
+    for row in rows:
+        if bcrypt.checkpw(payload.password.encode("utf-8"), row["password_hash"]):
+            matched = row
+            break
+    if matched is None:
+        raise HTTPException(status_code=401, detail="Email or password is incorrect.")
+    access_token, _ = _issue_recipient_session(matched["id"], email)
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "principal_type": "recipient",
+        "recipient": {
+            "email": email,
+            "name": matched["name"],
+            "role": "recipient",
+            "owner_name": matched["owner_name"],
+        },
+    }
+
+
+@app.get("/api/recipient/me")
+def recipient_me(recipient: dict = Depends(recipient_principal)) -> dict:
+    return {"recipient": recipient}
+
+
+@app.post("/api/recipient/logout", status_code=204)
+def recipient_logout(recipient: dict = Depends(recipient_principal)) -> None:
+    with db() as connection:
+        connection.execute(
+            "UPDATE recipient_sessions SET revoked_at=? WHERE id=? AND revoked_at IS NULL",
+            (utc_now().isoformat(), recipient["session_id"]),
+        )
+        audit(connection, recipient["owner_id"], f"recipient.signed_out:{recipient['recipient_id']}")
+
+
+@app.post("/api/nominee/login")
+def nominee_login(payload: LoginPayload) -> dict:
+    email = payload.email.strip().lower()
+    with db() as connection:
+        rows = connection.execute(
+            """SELECT nominee_accounts.password_hash,nominees.id,nominees.name,nominees.email,
+                      users.name AS owner_name
+               FROM nominee_accounts
+               JOIN nominees ON nominees.id=nominee_accounts.nominee_id
+               JOIN users ON users.id=nominees.owner_id
+               WHERE nominees.email=?""",
+            (email,),
+        ).fetchall()
+    matched = next(
+        (row for row in rows if bcrypt.checkpw(payload.password.encode("utf-8"), row["password_hash"])),
+        None,
+    )
+    if matched is None:
+        raise HTTPException(status_code=401, detail="Email or password is incorrect.")
+    access_token, _ = _issue_nominee_session(matched["id"], email)
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "principal_type": "nominee",
+        "nominee": {
+            "email": email,
+            "name": matched["name"],
+            "role": "nominee",
+            "owner_name": matched["owner_name"],
+        },
+    }
+
+
+@app.get("/api/nominee/me")
+def nominee_me(nominee: dict = Depends(nominee_principal)) -> dict:
+    return {"nominee": nominee}
+
+
+@app.post("/api/nominee/logout", status_code=204)
+def nominee_logout(nominee: dict = Depends(nominee_principal)) -> None:
+    with db() as connection:
+        connection.execute(
+            "UPDATE nominee_sessions SET revoked_at=? WHERE id=? AND revoked_at IS NULL",
+            (utc_now().isoformat(), nominee["session_id"]),
+        )
+        audit(connection, nominee["owner_id"], f"nominee.signed_out:{nominee['nominee_id']}")
+
+
+def _nominee_case_summary(connection: sqlite3.Connection, nominee_id: int) -> Optional[dict]:
+    row = connection.execute(
+        """SELECT id,status,note,evidence_name,evidence_type,evidence_size,
+                  reviewer_message,submitted_at,reviewed_at,updated_at
+           FROM death_cases WHERE nominee_id=?""",
+        (nominee_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+@app.get("/api/nominee/dashboard")
+def nominee_dashboard(nominee: dict = Depends(nominee_principal)) -> dict:
+    with db() as connection:
+        case = _nominee_case_summary(connection, nominee["nominee_id"])
+        events = connection.execute(
+            """SELECT id,event_type,detail,created_at
+               FROM nominee_case_events WHERE nominee_id=? ORDER BY id DESC LIMIT 6""",
+            (nominee["nominee_id"],),
+        ).fetchall()
+        hold = _medical_hold_state(connection, nominee["owner_id"])
+    return {
+        "nominee": {
+            "name": nominee["name"],
+            "email": nominee["email"],
+            "owner_name": nominee["owner_name"],
+            "role": "nominee",
+        },
+        "case": case,
+        "case_status": case["status"] if case else "not_submitted",
+        "medical_hold_status": hold["status"],
+        "events": [dict(row) for row in events],
+        "notice": (
+            "A Medical Hold is active. New releases are paused."
+            if hold["status"] != "inactive"
+            else "Submitting evidence does not approve a case or grant document access."
+        ),
+    }
+
+
+@app.get("/api/nominee/case")
+def nominee_case(nominee: dict = Depends(nominee_principal)) -> dict:
+    with db() as connection:
+        case = _nominee_case_summary(connection, nominee["nominee_id"])
+    return {"case": case}
+
+
+@app.post("/api/nominee/case", status_code=201)
+async def submit_nominee_case(
+    note: str = Form(default="", max_length=2000),
+    evidence: UploadFile = File(...),
+    nominee: dict = Depends(nominee_principal),
+) -> dict:
+    filename = Path(evidence.filename or "").name
+    suffix = Path(filename).suffix.lower()
+    if suffix not in {".pdf", ".jpg", ".jpeg", ".png"}:
+        raise HTTPException(status_code=415, detail="Upload a death certificate as a PDF, JPG, or PNG file.")
+    data = await evidence.read(MAX_DEATH_EVIDENCE_BYTES + 1)
+    if not data:
+        raise HTTPException(status_code=400, detail="The evidence file is empty.")
+    if len(data) > MAX_DEATH_EVIDENCE_BYTES:
+        raise HTTPException(status_code=413, detail="Evidence files must be 10 MB or smaller.")
+    signatures = {
+        ".pdf": data.startswith(b"%PDF-"),
+        ".jpg": data.startswith(b"\xff\xd8\xff"),
+        ".jpeg": data.startswith(b"\xff\xd8\xff"),
+        ".png": data.startswith(b"\x89PNG\r\n\x1a\n"),
+    }
+    if not signatures[suffix]:
+        raise HTTPException(status_code=415, detail="The uploaded file does not match its PDF, JPG, or PNG type.")
+
+    now = utc_now().isoformat()
+    with db() as connection:
+        existing = connection.execute(
+            "SELECT id,status FROM death_cases WHERE nominee_id=?",
+            (nominee["nominee_id"],),
+        ).fetchone()
+        if existing and existing["status"] != "more_information_required":
+            raise HTTPException(
+                status_code=409,
+                detail="A submitted case cannot be replaced unless the reviewer requests more information.",
+            )
+        if existing:
+            case_id = existing["id"]
+            connection.execute(
+                """UPDATE death_cases SET status='under_review',note=?,evidence_ciphertext=?,
+                          evidence_name=?,evidence_type=?,evidence_size=?,reviewer_email=NULL,
+                          reviewer_message='',reviewed_at=NULL,submitted_at=?,updated_at=?
+                   WHERE id=?""",
+                (
+                    note.strip(),
+                    encrypt_bytes(data),
+                    filename,
+                    evidence.content_type or "application/octet-stream",
+                    len(data),
+                    now,
+                    now,
+                    case_id,
+                ),
+            )
+            event_type = "evidence_resubmitted"
+            detail = "Updated evidence was submitted for review."
+        else:
+            cursor = connection.execute(
+                """INSERT INTO death_cases(owner_id,nominee_id,status,note,evidence_ciphertext,
+                          evidence_name,evidence_type,evidence_size,submitted_at,updated_at)
+                   VALUES(?,?,'under_review',?,?,?,?,?,?,?)""",
+                (
+                    nominee["owner_id"],
+                    nominee["nominee_id"],
+                    note.strip(),
+                    encrypt_bytes(data),
+                    filename,
+                    evidence.content_type or "application/octet-stream",
+                    len(data),
+                    now,
+                    now,
+                ),
+            )
+            case_id = cursor.lastrowid
+            event_type = "evidence_submitted"
+            detail = "Death notification and supporting evidence were submitted for review."
+        connection.execute(
+            """INSERT INTO nominee_case_events(nominee_id,owner_id,case_id,event_type,detail,created_at)
+               VALUES(?,?,?,?,?,?)""",
+            (nominee["nominee_id"], nominee["owner_id"], case_id, event_type, detail, now),
+        )
+        audit(connection, nominee["owner_id"], f"nominee.case_evidence_submitted:{case_id}")
+        case = _nominee_case_summary(connection, nominee["nominee_id"])
+    return {"case": case, "message": "Your case is submitted for review. This does not release documents."}
+
+
+@app.post("/api/reviewer/login")
+def reviewer_login(payload: LoginPayload) -> dict:
+    email = payload.email.strip().lower()
+    if not REVIEWER_EMAIL or not REVIEWER_PASSWORD_HASH:
+        raise HTTPException(status_code=503, detail="Reviewer sign-in is not configured.")
+    try:
+        password_matches = bcrypt.checkpw(
+            payload.password.encode("utf-8"),
+            REVIEWER_PASSWORD_HASH.encode("ascii"),
+        )
+    except (ValueError, UnicodeEncodeError) as error:
+        logger.exception("Configured reviewer password hash is invalid.")
+        raise HTTPException(status_code=503, detail="Reviewer sign-in is not configured correctly.") from error
+    if email != REVIEWER_EMAIL or not password_matches:
+        raise HTTPException(status_code=401, detail="Email or password is incorrect.")
+    access_token, _ = _issue_reviewer_session(email)
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "principal_type": "reviewer",
+        "reviewer": {"email": email, "role": "reviewer"},
+    }
+
+
+@app.get("/api/reviewer/me")
+def reviewer_me(reviewer: dict = Depends(reviewer_principal)) -> dict:
+    return {"reviewer": reviewer}
+
+
+@app.post("/api/reviewer/logout", status_code=204)
+def reviewer_logout(reviewer: dict = Depends(reviewer_principal)) -> None:
+    with db() as connection:
+        connection.execute(
+            "UPDATE reviewer_sessions SET revoked_at=? WHERE id=? AND revoked_at IS NULL",
+            (utc_now().isoformat(), reviewer["session_id"]),
+        )
+        audit(connection, None, "reviewer.signed_out")
+
+
+@app.get("/api/reviewer/cases")
+def reviewer_cases(reviewer: dict = Depends(reviewer_principal)) -> dict:
+    with db() as connection:
+        rows = connection.execute(
+            """SELECT death_cases.id,death_cases.status,death_cases.note,death_cases.evidence_name,
+                      death_cases.evidence_type,death_cases.evidence_size,death_cases.reviewer_message,
+                      death_cases.submitted_at,death_cases.reviewed_at,death_cases.updated_at,
+                      nominees.name AS nominee_name,nominees.email AS nominee_email,
+                      users.name AS owner_name,users.email AS owner_email
+               FROM death_cases
+               JOIN nominees ON nominees.id=death_cases.nominee_id
+               JOIN users ON users.id=death_cases.owner_id
+               ORDER BY CASE WHEN death_cases.status='under_review' THEN 0
+                             WHEN death_cases.status='more_information_required' THEN 1
+                             ELSE 2 END, death_cases.id DESC"""
+        ).fetchall()
+    return {"cases": [dict(row) for row in rows]}
+
+
+@app.get("/api/reviewer/cases/{case_id}/evidence")
+def reviewer_case_evidence(
+    case_id: int, reviewer: dict = Depends(reviewer_principal)
+) -> Response:
+    with db() as connection:
+        case = connection.execute(
+            """SELECT death_cases.owner_id,death_cases.nominee_id,death_cases.evidence_ciphertext,
+                      death_cases.evidence_name,death_cases.evidence_type,users.email AS owner_email,
+                      nominees.email AS nominee_email
+               FROM death_cases
+               JOIN users ON users.id=death_cases.owner_id
+               JOIN nominees ON nominees.id=death_cases.nominee_id
+               WHERE death_cases.id=?""",
+            (case_id,),
+        ).fetchone()
+        if case is None:
+            raise HTTPException(status_code=404, detail="Case was not found.")
+        if reviewer["email"] in {
+            case["owner_email"].strip().lower(),
+            case["nominee_email"].strip().lower(),
+        }:
+            raise HTTPException(status_code=403, detail="A case participant cannot review this evidence.")
+        try:
+            evidence = decrypt_bytes(case["evidence_ciphertext"])
+        except Exception as error:
+            logger.exception("Death-case evidence could not be decrypted.")
+            raise HTTPException(status_code=503, detail="The evidence could not be opened.") from error
+        audit(connection, case["owner_id"], f"nominee.case_evidence_viewed:{case_id}:{reviewer['email']}")
+    filename = Path(case["evidence_name"]).name.replace('"', "")
+    return Response(
+        content=evidence,
+        media_type=case["evidence_type"],
+        headers={
+            "Content-Disposition": f"attachment; filename=\"{filename}\"",
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "private, no-store",
+        },
+    )
+
+
+@app.post("/api/reviewer/cases/{case_id}/decision")
+def decide_nominee_case(
+    case_id: int,
+    payload: DeathCaseReviewPayload,
+    reviewer: dict = Depends(reviewer_principal),
+) -> dict:
+    now = utc_now().isoformat()
+    with db() as connection:
+        case = connection.execute(
+            """SELECT death_cases.owner_id,death_cases.nominee_id,death_cases.status,
+                      users.email AS owner_email,nominees.email AS nominee_email
+               FROM death_cases
+               JOIN users ON users.id=death_cases.owner_id
+               JOIN nominees ON nominees.id=death_cases.nominee_id
+               WHERE death_cases.id=?""",
+            (case_id,),
+        ).fetchone()
+        if case is None:
+            raise HTTPException(status_code=404, detail="Case was not found.")
+        if reviewer["email"] in {
+            case["owner_email"].strip().lower(),
+            case["nominee_email"].strip().lower(),
+        }:
+            raise HTTPException(status_code=403, detail="A case participant cannot review their own case.")
+        if case["status"] != "under_review":
+            raise HTTPException(status_code=409, detail="Only cases under review can receive a decision.")
+        connection.execute(
+            """UPDATE death_cases SET status=?,reviewer_email=?,reviewer_message=?,
+                      reviewed_at=?,updated_at=? WHERE id=?""",
+            (payload.decision, reviewer["email"], payload.message.strip(), now, now, case_id),
+        )
+        detail = payload.message.strip()
+        connection.execute(
+            """INSERT INTO nominee_case_events(nominee_id,owner_id,case_id,event_type,detail,created_at)
+               VALUES(?,?,?,?,?,?)""",
+            (
+                case["nominee_id"],
+                case["owner_id"],
+                case_id,
+                f"case_{payload.decision}",
+                detail,
+                now,
+            ),
+        )
+        audit(connection, case["owner_id"], f"nominee.case_reviewed:{case_id}:{payload.decision}:{reviewer['email']}")
+        updated_case = _nominee_case_summary(connection, case["nominee_id"])
+    return {"case": updated_case, "message": "Case decision recorded. Document access has not been released."}
+
+
+@app.get("/api/nominee/history")
+def nominee_history(nominee: dict = Depends(nominee_principal)) -> dict:
+    with db() as connection:
+        events = connection.execute(
+            """SELECT id,event_type,detail,created_at
+               FROM nominee_case_events WHERE nominee_id=? ORDER BY id DESC LIMIT 100""",
+            (nominee["nominee_id"],),
+        ).fetchall()
+    return {"events": [dict(row) for row in events]}
+
+
+@app.get("/api/recipient/dashboard")
+def recipient_dashboard(recipient: dict = Depends(recipient_principal)) -> dict:
+    with db() as connection:
+        documents = _recipient_documents(connection, recipient["recipient_id"])
+        hold = _medical_hold_state(connection, recipient["owner_id"])
+        events = connection.execute(
+            """SELECT id,event_type,document_id,detail,created_at
+               FROM recipient_events WHERE recipient_id=? ORDER BY id DESC LIMIT 8""",
+            (recipient["recipient_id"],),
+        ).fetchall()
+    available = sum(1 for item in documents if item["access_status"] == "available")
+    pending = sum(1 for item in documents if item["access_status"] == "pending")
+    revoked = sum(1 for item in documents if item["access_status"] == "revoked")
+    if hold["status"] != "inactive":
+        availability = (
+            "A Medical Hold is active or awaiting a fresh successful owner check-in. "
+            "Document access is paused."
+        )
+    elif available:
+        availability = (
+            f"{available} assigned document{'s' if available != 1 else ''} available to open or download."
+        )
+    elif pending:
+        availability = (
+            "Assigned documents are not yet available. Access stays locked until the owner "
+            "completes and approves release."
+        )
+    else:
+        availability = (
+            "No documents are currently available to you. An invitation does not grant document access."
+        )
+    return {
+        "recipient": {
+            "email": recipient["email"],
+            "name": recipient["name"],
+            "owner_name": recipient["owner_name"],
+            "role": "recipient",
+        },
+        "availability": availability,
+        "medical_hold_status": hold["status"],
+        "counts": {"available": available, "pending": pending, "revoked": revoked, "assigned": len(documents)},
+        "events": [dict(row) for row in events],
+    }
+
+
+@app.get("/api/recipient/documents")
+def recipient_list_documents(recipient: dict = Depends(recipient_principal)) -> dict:
+    with db() as connection:
+        documents = _recipient_documents(connection, recipient["recipient_id"])
+    return {"documents": documents}
+
+
+@app.get("/api/recipient/documents/{document_id}")
+def recipient_document_details(
+    document_id: int, recipient: dict = Depends(recipient_principal)
+) -> dict:
+    with db() as connection:
+        documents = _recipient_documents(connection, recipient["recipient_id"])
+    document = next((item for item in documents if item["id"] == document_id), None)
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document was not found.")
+    return {"document": document}
+
+
+@app.get("/api/recipient/documents/{document_id}/download")
+def recipient_download_document(
+    document_id: int, recipient: dict = Depends(recipient_principal)
+) -> Response:
+    with db() as connection:
+        share = connection.execute(
+            """SELECT documents.id, documents.file_name, documents.content_type, documents.encrypted_data,
+                      document_releases.status AS release_status,
+                      COALESCE(medical_holds.status,'inactive') AS hold_status,
+                      EXISTS(SELECT 1 FROM death_cases
+                             WHERE death_cases.owner_id=documents.owner_id
+                               AND death_cases.status='approved') AS case_approved
+               FROM document_shares
+               JOIN documents ON documents.id = document_shares.document_id
+               LEFT JOIN document_releases
+                 ON document_releases.document_id = documents.id
+                AND document_releases.recipient_id = document_shares.recipient_id
+               LEFT JOIN medical_holds ON medical_holds.owner_id=documents.owner_id
+               WHERE document_shares.recipient_id=? AND documents.id=?""",
+            (recipient["recipient_id"], document_id),
+        ).fetchone()
+        if share is None:
+            raise HTTPException(status_code=404, detail="Document was not found.")
+        if share["hold_status"] != "inactive":
+            raise HTTPException(
+                status_code=403,
+                detail="Document access is paused by the owner's Medical Hold.",
+            )
+        if not share["case_approved"]:
+            raise HTTPException(
+                status_code=403,
+                detail="No death-notification case has been approved. Document access remains locked.",
+            )
+        if share["release_status"] != "available":
+            raise HTTPException(
+                status_code=403,
+                detail="This document is not available. Access stays locked until the owner approves release.",
+            )
+        try:
+            plaintext = decrypt_bytes(share["encrypted_data"])
+        except Exception as error:
+            raise HTTPException(status_code=503, detail="The document could not be decrypted.") from error
+        _log_recipient_event(
+            connection,
+            recipient["recipient_id"],
+            recipient["owner_id"],
+            "document_downloaded",
+            document_id,
+            "The recipient downloaded an approved document.",
+        )
+        audit(connection, recipient["owner_id"], f"recipient.document_downloaded:{document_id}:{recipient['recipient_id']}")
+    filename = Path(share["file_name"] or "document").name.replace('"', "")
+    return Response(
+        content=plaintext,
+        media_type=share["content_type"] or "application/octet-stream",
+        headers={
+            "Content-Disposition": f"attachment; filename=\"{filename}\"; filename*=UTF-8''{quote(filename)}",
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "private, no-store",
+        },
+    )
+
+
+@app.get("/api/recipient/history")
+def recipient_history(recipient: dict = Depends(recipient_principal)) -> dict:
+    with db() as connection:
+        rows = connection.execute(
+            """SELECT id,event_type,document_id,detail,created_at
+               FROM recipient_events WHERE recipient_id=? ORDER BY id DESC LIMIT 100""",
+            (recipient["recipient_id"],),
+        ).fetchall()
+    return {"events": [dict(row) for row in rows]}
 
 
 @app.post("/api/auth/register", status_code=201)
@@ -383,6 +2023,12 @@ def dashboard(user: sqlite3.Row = Depends(current_user)) -> dict:
         recipients = connection.execute(
             "SELECT COUNT(*) AS count FROM recipients WHERE owner_id=?", (user["id"],)
         ).fetchone()["count"]
+        hold = _medical_hold_state(connection, user["id"])
+        case = connection.execute(
+            """SELECT id,status,reviewer_message,submitted_at,reviewed_at
+               FROM death_cases WHERE owner_id=?""",
+            (user["id"],),
+        ).fetchone()
     next_due = None
     if last and last["status"] == "success":
         next_due = (
@@ -395,6 +2041,8 @@ def dashboard(user: sqlite3.Row = Depends(current_user)) -> dict:
         "next_checkin": next_due,
         "documents_count": docs,
         "recipients_count": recipients,
+        "medical_hold": hold,
+        "nominee_case": dict(case) if case else None,
     }
 
 
@@ -406,13 +2054,67 @@ def list_documents(user: sqlite3.Row = Depends(current_user)) -> dict:
                FROM documents WHERE owner_id=? ORDER BY id DESC""",
             (user["id"],),
         ).fetchall()
-    return {"documents": [dict(row) for row in rows]}
+        shares = connection.execute(
+            """SELECT document_shares.document_id, document_shares.recipient_id
+               FROM document_shares
+               JOIN documents ON document_shares.document_id = documents.id
+               WHERE documents.owner_id=?""",
+            (user["id"],),
+        ).fetchall()
+        releases = connection.execute(
+            """SELECT document_releases.document_id, document_releases.recipient_id, document_releases.status
+               FROM document_releases
+               JOIN documents ON document_releases.document_id = documents.id
+               WHERE documents.owner_id=?""",
+            (user["id"],),
+        ).fetchall()
+        hold_status = _medical_hold_state(connection, user["id"])["status"]
+        case_approved = connection.execute(
+            "SELECT 1 FROM death_cases WHERE owner_id=? AND status='approved'",
+            (user["id"],),
+        ).fetchone() is not None
+
+    shares_by_doc = {}
+    for row in shares:
+        shares_by_doc.setdefault(row["document_id"], []).append(row["recipient_id"])
+    release_by_doc = {}
+    for row in releases:
+        release_by_doc.setdefault(row["document_id"], {})[row["recipient_id"]] = row["status"]
+
+    docs = []
+    for row in rows:
+        d = dict(row)
+        recipient_ids = shares_by_doc.get(row["id"], [])
+        d["recipient_ids"] = recipient_ids
+        d["assignments"] = [
+            {
+                "recipient_id": recipient_id,
+                "access_status": (
+                    "revoked"
+                    if release_by_doc.get(row["id"], {}).get(recipient_id) == "revoked"
+                    else "on_hold"
+                    if release_by_doc.get(row["id"], {}).get(recipient_id) == "available"
+                    and hold_status != "inactive"
+                    else "available"
+                    if release_by_doc.get(row["id"], {}).get(recipient_id) == "available"
+                    and case_approved
+                    else "pending"
+                ),
+                "release_hold": hold_status != "inactive",
+                "case_approved": case_approved,
+            }
+            for recipient_id in recipient_ids
+        ]
+        docs.append(d)
+
+    return {"documents": docs}
 
 
 @app.post("/api/documents", status_code=201)
 async def upload_document(
     name: str = Form(..., min_length=2, max_length=120),
     category: str = Form(..., min_length=2, max_length=40),
+    recipient_ids_json: str = Form(default="[]"),
     file: UploadFile = File(...),
     user: sqlite3.Row = Depends(current_user),
 ) -> dict:
@@ -424,21 +2126,188 @@ async def upload_document(
         raise HTTPException(status_code=400, detail="The selected file is empty.")
     if len(data) > MAX_FILE_BYTES:
         raise HTTPException(status_code=413, detail="Files must be 25 MB or smaller.")
+    try:
+        recipient_ids = json.loads(recipient_ids_json)
+    except json.JSONDecodeError as error:
+        raise HTTPException(
+            status_code=422, detail="Recipient assignments must be a JSON array of IDs."
+        ) from error
+    if not isinstance(recipient_ids, list) or any(
+        type(recipient_id) is not int or recipient_id < 1
+        for recipient_id in recipient_ids
+    ):
+        raise HTTPException(
+            status_code=422, detail="Recipient assignments must be a JSON array of positive IDs."
+        )
+    recipient_ids = list(dict.fromkeys(recipient_ids))
     content_type = file.content_type or "application/octet-stream"
     with db() as connection:
+        _validate_recipient_ownership(connection, user["id"], recipient_ids)
         cursor = connection.execute(
             """INSERT INTO documents(owner_id,name,category,file_name,content_type,file_size,encrypted_data,created_at)
                VALUES(?,?,?,?,?,?,?,?)""",
             (user["id"], name.strip(), category, Path(file.filename or "document").name,
              content_type, len(data), encrypt_bytes(data), utc_now().isoformat()),
         )
+        document_id = cursor.lastrowid
+        if recipient_ids:
+            _replace_document_shares(connection, user["id"], document_id, recipient_ids)
         audit(connection, user["id"], f"document.uploaded:{cursor.lastrowid}")
+        if recipient_ids:
+            audit(connection, user["id"], f"document.shares_updated:{document_id}")
         row = connection.execute(
             """SELECT id,name,category,file_name,content_type,file_size,created_at
-               FROM documents WHERE id=?""",
-            (cursor.lastrowid,),
+               FROM documents WHERE id=? AND owner_id=?""",
+            (document_id, user["id"]),
         ).fetchone()
     return {"document": dict(row)}
+
+
+
+class UpdateSharesPayload(BaseModel):
+    recipient_ids: list[StrictInt]
+
+
+def _validate_recipient_ownership(
+    connection: sqlite3.Connection, owner_id: int, recipient_ids: list[int]
+) -> None:
+    if not recipient_ids:
+        return
+    placeholders = ",".join("?" for _ in recipient_ids)
+    rows = connection.execute(
+        f"SELECT id FROM recipients WHERE owner_id=? AND id IN ({placeholders})",
+        (owner_id, *recipient_ids),
+    ).fetchall()
+    if {row["id"] for row in rows} != set(recipient_ids):
+        raise HTTPException(status_code=400, detail="Invalid recipient selected.")
+
+@app.put("/api/documents/{document_id}/shares")
+def update_document_shares(
+    document_id: int, payload: UpdateSharesPayload, user: sqlite3.Row = Depends(current_user)
+) -> dict:
+    with db() as connection:
+        doc = connection.execute("SELECT id FROM documents WHERE id=? AND owner_id=?", (document_id, user["id"])).fetchone()
+        if not doc:
+            raise HTTPException(status_code=404, detail="Document not found.")
+        recipient_ids = list(dict.fromkeys(payload.recipient_ids))
+        _validate_recipient_ownership(connection, user["id"], recipient_ids)
+        _replace_document_shares(connection, user["id"], document_id, recipient_ids)
+        audit(connection, user["id"], f"document.shares_updated:{document_id}")
+
+    return {"message": "Document assignments updated."}
+
+
+@app.post("/api/documents/{document_id}/releases", status_code=200)
+def approve_document_release(
+    document_id: int, payload: ReleasePayload, user: sqlite3.Row = Depends(current_user)
+) -> dict:
+    with db() as connection:
+        document = connection.execute(
+            "SELECT id FROM documents WHERE id=? AND owner_id=?",
+            (document_id, user["id"]),
+        ).fetchone()
+        if document is None:
+            raise HTTPException(status_code=404, detail="Document was not found.")
+        _validate_recipient_ownership(connection, user["id"], [payload.recipient_id])
+        share = connection.execute(
+            "SELECT recipient_id FROM document_shares WHERE document_id=? AND recipient_id=?",
+            (document_id, payload.recipient_id),
+        ).fetchone()
+        if share is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Release can only be approved for a recipient currently assigned to this document.",
+            )
+        hold = _medical_hold_state(connection, user["id"])
+        if hold["status"] != "inactive":
+            raise HTTPException(
+                status_code=409,
+                detail="Document release is paused by the Medical Hold. End the hold and complete a fresh successful live check-in first.",
+            )
+        approved_case = connection.execute(
+            "SELECT id FROM death_cases WHERE owner_id=? AND status='approved'",
+            (user["id"],),
+        ).fetchone()
+        if approved_case is None:
+            raise HTTPException(
+                status_code=409,
+                detail="A nominee case must be approved by an authorized reviewer before document release can be considered.",
+            )
+        _set_document_release(connection, document_id, payload.recipient_id, "available")
+        _log_recipient_event(
+            connection,
+            payload.recipient_id,
+            user["id"],
+            "release_approved",
+            document_id,
+            "The owner approved release of this document.",
+        )
+        audit(connection, user["id"], f"document.release_approved:{document_id}:{payload.recipient_id}")
+    return {"message": "Release approved. The assigned recipient can now open this document.", "access_status": "available"}
+
+
+@app.delete("/api/documents/{document_id}/releases/{recipient_id}", status_code=200)
+def revoke_document_release(
+    document_id: int, recipient_id: int, user: sqlite3.Row = Depends(current_user)
+) -> dict:
+    with db() as connection:
+        document = connection.execute(
+            "SELECT id FROM documents WHERE id=? AND owner_id=?",
+            (document_id, user["id"]),
+        ).fetchone()
+        if document is None:
+            raise HTTPException(status_code=404, detail="Document was not found.")
+        _validate_recipient_ownership(connection, user["id"], [recipient_id])
+        _set_document_release(connection, document_id, recipient_id, "revoked")
+        _log_recipient_event(
+            connection,
+            recipient_id,
+            user["id"],
+            "access_revoked",
+            document_id,
+            "The owner revoked access to this document.",
+        )
+        audit(connection, user["id"], f"document.release_revoked:{document_id}:{recipient_id}")
+    return {"message": "Access revoked. The recipient can no longer open this document.", "access_status": "revoked"}
+
+
+@app.get("/api/medical-hold")
+def get_medical_hold(user: sqlite3.Row = Depends(current_user)) -> dict:
+    with db() as connection:
+        hold = _medical_hold_state(connection, user["id"])
+    return {"medical_hold": hold}
+
+
+@app.put("/api/medical-hold")
+def update_medical_hold(
+    payload: MedicalHoldPayload, user: sqlite3.Row = Depends(current_user)
+) -> dict:
+    now = utc_now().isoformat()
+    with db() as connection:
+        hold = _medical_hold_state(connection, user["id"])
+        if payload.action == "start":
+            connection.execute(
+                """INSERT INTO medical_holds(owner_id,status,started_at,ended_at,updated_at)
+                   VALUES(?,'active',?,NULL,?)
+                   ON CONFLICT(owner_id) DO UPDATE SET status='active',started_at=excluded.started_at,
+                     ended_at=NULL,updated_at=excluded.updated_at""",
+                (user["id"], now, now),
+            )
+            audit(connection, user["id"], "medical_hold.started")
+        else:
+            if hold["status"] != "active":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Only an active Medical Hold can be ended.",
+                )
+            connection.execute(
+                """UPDATE medical_holds SET status='awaiting_checkin',ended_at=?,updated_at=?
+                   WHERE owner_id=?""",
+                (now, now, user["id"]),
+            )
+            audit(connection, user["id"], "medical_hold.ended_awaiting_checkin")
+        updated = _medical_hold_state(connection, user["id"])
+    return {"medical_hold": updated}
 
 
 @app.get("/api/documents/{document_id}/download")
@@ -504,6 +2373,7 @@ def update_recipient(
     recipient_id: int, payload: RecipientPayload, user: sqlite3.Row = Depends(current_user)
 ) -> dict:
     with db() as connection:
+        revoke_target_invitations(connection, user["id"], "recipient", recipient_id)
         cursor = connection.execute(
             """UPDATE recipients SET name=?,email=?,relationship=?
                WHERE id=? AND owner_id=?""",
@@ -523,6 +2393,7 @@ def update_recipient(
 @app.delete("/api/recipients/{recipient_id}", status_code=204)
 def delete_recipient(recipient_id: int, user: sqlite3.Row = Depends(current_user)) -> None:
     with db() as connection:
+        revoke_target_invitations(connection, user["id"], "recipient", recipient_id)
         cursor = connection.execute(
             "DELETE FROM recipients WHERE id=? AND owner_id=?", (recipient_id, user["id"])
         )
@@ -549,6 +2420,8 @@ def save_nominee(payload: NomineePayload, user: sqlite3.Row = Depends(current_us
         existing = connection.execute(
             "SELECT id FROM nominees WHERE owner_id=?", (user["id"],)
         ).fetchone()
+        if existing:
+            revoke_target_invitations(connection, user["id"], "nominee", existing["id"])
         connection.execute(
             """INSERT INTO nominees(owner_id,name,email,relationship,phone,created_at,updated_at)
                VALUES(?,?,?,?,?,?,?)
@@ -573,6 +2446,11 @@ def save_nominee(payload: NomineePayload, user: sqlite3.Row = Depends(current_us
 @app.delete("/api/nominee", status_code=204)
 def delete_nominee(user: sqlite3.Row = Depends(current_user)) -> None:
     with db() as connection:
+        existing = connection.execute(
+            "SELECT id FROM nominees WHERE owner_id=?", (user["id"],)
+        ).fetchone()
+        if existing:
+            revoke_target_invitations(connection, user["id"], "nominee", existing["id"])
         cursor = connection.execute("DELETE FROM nominees WHERE owner_id=?", (user["id"],))
         if cursor.rowcount:
             audit(connection, user["id"], "nominee.removed")
@@ -609,11 +2487,15 @@ def create_checkin(
         enrollment_samples = json.loads(decrypt_bytes(owner["face_enrollment"]))
     except (ValueError, TypeError) as error:
         raise HTTPException(status_code=409, detail="Face enrollment data could not be read. Please contact support.") from error
+    checkin_started_at = utc_now()
     with tempfile.TemporaryDirectory(prefix="cloudguard-checkin-") as directory:
         video_path = Path(directory) / f"recording{suffix}"
         video_path.write_bytes(data)
         try:
             statuses = verify_recording(video_path, enrollment_samples, sentence)
+            required = {"face_status", "liveness_status", "speech_status"}
+            if not isinstance(statuses, dict) or not required.issubset(statuses):
+                raise VerificationUnavailable("Local verification produced an incomplete result.")
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         except VerificationUnavailable as error:
@@ -627,6 +2509,18 @@ def create_checkin(
     passed = all(statuses.get(check) == "passed" for check in ("face_status", "liveness_status", "speech_status"))
     checkin_status = "success" if passed else "failed"
     event = "checkin.verified_passed" if passed else "checkin.verified_failed"
+    face_detail = statuses.get("face_detail") or ("matched" if statuses.get("face_status") == "passed" else "different_person")
+    if not passed and statuses.get("face_status") != "passed":
+        if face_detail == "different_person":
+            message = "Face verification failed: this person does not match the enrolled face."
+        elif face_detail == "no_face":
+            message = "Face verification failed: no usable face was found in the check-in recording."
+        else:
+            message = "Face verification did not pass."
+    elif passed:
+        message = "All verification checks passed."
+    else:
+        message = "One or more verification checks did not pass."
     with db() as connection:
         cursor = connection.execute(
             """INSERT INTO checkins(owner_id,mode,status,face_status,liveness_status,speech_status,sentence,created_at)
@@ -635,11 +2529,25 @@ def create_checkin(
              statuses["speech_status"], sentence, utc_now().isoformat()),
         )
         audit(connection, user["id"], f"{event}:{cursor.lastrowid}")
+        hold = _medical_hold_state(connection, user["id"])
+        if (
+            passed
+            and hold["status"] == "awaiting_checkin"
+            and hold["ended_at"]
+            and checkin_started_at >= datetime.fromisoformat(hold["ended_at"])
+        ):
+            connection.execute(
+                "UPDATE medical_holds SET status='inactive',updated_at=? WHERE owner_id=?",
+                (utc_now().isoformat(), user["id"]),
+            )
+            audit(connection, user["id"], "medical_hold.fresh_checkin_completed")
         row = connection.execute("SELECT * FROM checkins WHERE id=?", (cursor.lastrowid,)).fetchone()
+    checkin = dict(row)
+    checkin["face_detail"] = face_detail
     return {
-        "checkin": dict(row),
+        "checkin": checkin,
         "passed": passed,
-        "message": "All verification checks passed." if passed else "One or more verification checks did not pass.",
+        "message": message,
     }
 
 

@@ -8,7 +8,10 @@ A responsive digital-legacy vault prototype built with React + Vite, FastAPI, an
 - Five camera-captured face enrollment samples, stored encrypted at rest and used for local FaceNet comparisons during check-in.
 - User-owned files encrypted at rest using AES-256-GCM, with authenticated encrypted-export and delete routes. Supports PDF, TXT, common Office documents, images, audio, video, and archives (25 MB maximum).
 - Owner-managed trusted-contact records with add, edit, and remove.
-- A separate, single nominee contact record; nominee records do not create logins or grant document access.
+- A separate nominee account and portal for submitting an encrypted death certificate and tracking an independently reviewed case.
+- Role-specific, email-verified invitations for nominees and recipients. Invitation claims create separate accounts and role-scoped sessions; nominees and recipients never receive owner routes.
+- A separately authenticated reviewer portal for inspecting submitted evidence and recording case decisions.
+- Owner-controlled Medical Hold and explicit release gates: an approved reviewer case, owner approval, and no active hold are required before recipient access; ending a hold requires a fresh successful owner check-in.
 - Face match, anti-spoof liveness, and spoken-phrase checks using DeepFace and faster-whisper. The server deletes each uploaded recording after analysis.
 - Private check-in history and an append-only, SHA-256 hash-chained activity table.
 - Responsive dashboard, profile settings, password visibility controls, and a profile-menu sign-out action.
@@ -51,9 +54,25 @@ The phrase stays visible throughout the 10-second camera and microphone recordin
 
 The development launcher installs the AI packages along with the API dependencies, using DeepFace's TensorFlow CPU engine on Windows. The first check-in downloads model weights (including the `small.en` speech model) and may take several minutes and hundreds of megabytes; later checks reuse the cached models. CPU inference can take time. Model weights are downloaded by their respective packages, but check-in recordings are processed only by the configured API server. Set `CLOUDGUARD_WHISPER_MODEL` in `backend\.env` to choose another faster-whisper model. Anti-spoofing and face matching are probabilistic checks, not a guarantee of identity or proof against every attack.
 
-## Recipient access boundary
+## Invitation and recipient access boundary
 
-Trusted recipients and the single nominee are separate owner-side contact records. There is no recipient/nominee account, invitation, portal, release review, or document-sharing path in this version. A later portal should use a separate role and sign-in tied to the invited email, with no access by default. Document access should only be granted after the future owner-defined release and verification workflow is implemented and approved. This prototype never releases files automatically.
+Trusted recipients and the single nominee have separate invitation roles. Configure `RESEND_API_KEY`, `RESEND_FROM_EMAIL` (an address on a verified Resend domain), and `CLOUDGUARD_APP_URL` in `backend\.env`; never commit that file. Invitation links expire after seven days and can only be claimed once. Recipients and nominees each create a password from their invitation and sign in through their own portal. A person invited in both roles gets separate role-scoped sessions and permissions.
+
+Recipients see only documents assigned to them. An invitation, nominee submission, reviewer decision, or missed owner check-in alone never releases a file. A reviewer must approve a submitted case, then the owner must explicitly approve each assigned document's release. The API blocks downloads if the case is not approved, the release is revoked, or a Medical Hold is active or awaiting a fresh check-in.
+
+Nominees can submit a death certificate as a PDF, JPG, or PNG (10 MB maximum) with an optional note. Evidence is encrypted at rest. A reviewer can approve, reject, or request more information; a nominee cannot review their own case. Case approval is not document access and does not release any file.
+
+The reviewer portal is disabled until a reviewer account is configured in `backend\.env` with `CLOUDGUARD_REVIEWER_EMAIL` and a bcrypt `CLOUDGUARD_REVIEWER_PASSWORD_HASH`. Generate a hash in PowerShell from the backend folder:
+
+```powershell
+.\.venv\Scripts\python.exe -c "import bcrypt,getpass; print(bcrypt.hashpw(getpass.getpass('Reviewer password: ').encode(), bcrypt.gensalt()).decode())"
+```
+
+Keep the hash private. The current prototype supports one separately configured reviewer account; it does not include reviewer enrollment or multi-reviewer administration.
+
+Owners can start and end a Medical Hold from the dashboard. While active or awaiting a fresh check-in, the API pauses new releases and blocks recipient downloads. Ending a hold moves it to `awaiting_checkin`; only a successful live check-in started after the hold ended resumes release eligibility. No escalation scheduler is implemented, and missed check-ins never release files.
+
+Resend must accept the message before CloudGuard reports an invitation as sent. Resend account and domain verification limits (including any trial-account recipient restrictions, sending quota, and rate limits) still apply; provider rejection leaves the invitation inactive and the owner must resolve the Resend configuration or quota issue before retrying.
 
 ## Encrypted document exports
 
@@ -61,7 +80,8 @@ Downloads are the original AES-256-GCM ciphertext, saved with a `.cgenc` extensi
 
 ## Security notes
 
-- The development launcher generates strong local secrets automatically. For any non-development deployment, configure independent secrets and never publish `.env` or the encryption key.
+- The development launcher generates strong local secrets automatically. For any non-development deployment, configure independent secrets and never publish `.env`, reviewer credentials, or the encryption key.
+- Configure a verified Resend sender and a publicly reachable frontend URL before inviting guests. Keep the Resend API key only in `backend\.env`; the guest email link is single-use and expires after seven days.
 - AES-GCM encrypts each file with a unique random nonce. SQLite stores ciphertext and metadata; downloads return that ciphertext only after checking the authenticated owner.
 - This is a student prototype, not a production security or legal-legacy service. Use HTTPS, rate limiting, key management/rotation, backups, account recovery, and a reviewed release workflow before real-world deployment.
-- Missed-check-in scheduling, warning escalation, email notifications, nominee validation, death-certificate OCR, and automatic release are intentionally out of scope.
+- Missed-check-in scheduling, warning escalation, reviewer enrollment, multi-reviewer administration, nominee identity validation, death-certificate OCR, and automatic release are intentionally out of scope. The app does not make a legal determination of death; reviewers must follow an appropriate external process.
