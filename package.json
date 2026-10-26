@@ -8,13 +8,14 @@
     "dev:web": "vite --host 0.0.0.0",
     "dev:api": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-api.ps1",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "check-env": "node check-env.js"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.118.0",
     "@vitejs/plugin-react": "^4.3.4",
-    "vite": "^6.0.7",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
-  },
-  "devDependencies": {}
+    "react-dom": "^18.3.1",
+    "vite": "^6.0.7"
+  }
 }

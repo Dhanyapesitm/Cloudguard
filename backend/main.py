@@ -6,12 +6,20 @@ import os
 import re
 import secrets
 import sqlite3
+import sys
 import tempfile
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, Optional
 from urllib.parse import quote, urlencode, urlsplit
+
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 import bcrypt
 import jwt
@@ -29,12 +37,19 @@ from verification import VerificationUnavailable, providers_available, verify_re
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 os.environ.setdefault("DEEPFACE_BACKEND_ENGINE", os.getenv("CLOUDGUARD_DEEPFACE_ENGINE", "tensorflow"))
-DATABASE = Path(os.getenv("CLOUDGUARD_DATABASE", str(BASE_DIR / "cloudguard.db")))
+_db_env = os.getenv("CLOUDGUARD_DATABASE")
+if _db_env:
+    _db_path = Path(_db_env)
+    DATABASE = _db_path if _db_path.is_absolute() else (BASE_DIR / _db_path).resolve()
+else:
+    DATABASE = (BASE_DIR / "cloudguard.db").resolve()
 JWT_SECRET = os.getenv("CLOUDGUARD_JWT_SECRET")
 FILE_KEY_B64 = os.getenv("CLOUDGUARD_FILE_KEY")
 ENVIRONMENT = os.getenv("CLOUDGUARD_ENV", "development")
 REVIEWER_EMAIL = os.getenv("CLOUDGUARD_REVIEWER_EMAIL", "").strip().lower()
 REVIEWER_PASSWORD_HASH = os.getenv("CLOUDGUARD_REVIEWER_PASSWORD_HASH", "")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "").strip()
 MAX_FILE_BYTES = 25 * 1024 * 1024
 MAX_CHECKIN_BYTES = 20 * 1024 * 1024
 MAX_DEATH_EVIDENCE_BYTES = 10 * 1024 * 1024
@@ -93,6 +108,13 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _parse_iso_utc(ts: str) -> datetime:
+    dt = datetime.fromisoformat(ts)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 @contextmanager
 def db():
     connection = sqlite3.connect(DATABASE)
@@ -141,7 +163,8 @@ def init_database() -> None:
                 password_hash BLOB NOT NULL,
                 face_enrollment BLOB,
                 checkin_interval INTEGER NOT NULL DEFAULT 30,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                supabase_uid TEXT UNIQUE
             );
             CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY,
@@ -304,8 +327,19 @@ def init_database() -> None:
                 previous_hash TEXT NOT NULL,
                 event_hash TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS revoked_tokens (
+                token_id TEXT PRIMARY KEY,
+                user_id INTEGER,
+                revoked_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            );
             """
         )
+        try:
+            connection.execute("ALTER TABLE users ADD COLUMN supabase_uid TEXT")
+        except sqlite3.OperationalError:
+            pass
+        connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_supabase_uid ON users(supabase_uid)")
 
 
 def audit(connection: sqlite3.Connection, owner_id: Optional[int], event: str) -> None:
@@ -328,6 +362,94 @@ def audit(connection: sqlite3.Connection, owner_id: Optional[int], event: str) -
     )
 
 
+_jwks_clients: dict[str, jwt.PyJWKClient] = {}
+
+
+def get_jwks_client(supabase_url: str) -> jwt.PyJWKClient:
+    url = supabase_url.rstrip("/")
+    jwks_uri = f"{url}/auth/v1/.well-known/jwks.json"
+    if jwks_uri not in _jwks_clients:
+        _jwks_clients[jwks_uri] = jwt.PyJWKClient(
+            jwks_uri,
+            cache_jwk_set=True,
+            lifespan=600,
+            headers={"User-Agent": "CloudGuard/1.0"},
+            timeout=10,
+        )
+    return _jwks_clients[jwks_uri]
+
+
+def verify_supabase_jwt(raw_token: str) -> Optional[dict]:
+    """
+    Verifies a Supabase-issued JWT access token.
+    Supports both:
+    1. Modern asymmetric signing (ES256, RS256) via the Supabase JWKS endpoint.
+    2. Legacy symmetric signing (HS256, HS384, HS512) via SUPABASE_JWT_SECRET.
+    Returns the verified token payload if valid, None if not a Supabase token or not configured.
+    Raises HTTPException 401 if it is a Supabase token with invalid/expired signature.
+    """
+    if not raw_token:
+        return None
+    try:
+        unverified_header = jwt.get_unverified_header(raw_token)
+        unverified = jwt.decode(raw_token, options={"verify_signature": False})
+        aud = unverified.get("aud")
+        iss = unverified.get("iss", "")
+        is_supabase = (
+            aud == "authenticated"
+            or (isinstance(aud, list) and "authenticated" in aud)
+            or ("auth/v1" in iss)
+        )
+        if not is_supabase:
+            return None
+    except Exception:
+        return None
+
+    alg = unverified_header.get("alg", "HS256")
+
+    # 1. Asymmetric algorithms (ES256, RS256, etc.) - modern Supabase default
+    if alg in ("ES256", "RS256", "ES384", "ES512", "RS384", "RS512"):
+        if not SUPABASE_URL:
+            return None
+        try:
+            jwks_client = get_jwks_client(SUPABASE_URL)
+            signing_key = jwks_client.get_signing_key_from_jwt(raw_token)
+            payload = jwt.decode(
+                raw_token,
+                signing_key.key,
+                algorithms=[alg],
+                audience="authenticated",
+                options={"verify_exp": True, "verify_aud": True},
+                leeway=60,
+            )
+            return payload
+        except (jwt.InvalidTokenError, ValueError, Exception) as error:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"Supabase authentication token is invalid or expired ({alg}): {str(error)}",
+            ) from error
+
+    # 2. Symmetric algorithms (HS256, HS384, HS512) - legacy Supabase default
+    if not SUPABASE_JWT_SECRET:
+        return None
+
+    try:
+        payload = jwt.decode(
+            raw_token,
+            SUPABASE_JWT_SECRET,
+            algorithms=["HS256", "HS384", "HS512"],
+            audience="authenticated",
+            options={"verify_exp": True, "verify_aud": True},
+            leeway=60,
+        )
+        return payload
+    except (jwt.InvalidTokenError, ValueError) as error:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Supabase authentication token is invalid or expired ({alg}): {str(error)}",
+        ) from error
+
+
 def public_user(row: sqlite3.Row) -> dict:
     return {
         "id": row["id"],
@@ -336,6 +458,7 @@ def public_user(row: sqlite3.Row) -> dict:
         "phone": row["phone"],
         "checkin_interval": row["checkin_interval"],
         "created_at": row["created_at"],
+        "supabase_uid": row["supabase_uid"] if "supabase_uid" in row.keys() else None,
     }
 
 
@@ -343,8 +466,9 @@ class RegisterPayload(BaseModel):
     name: str = Field(min_length=2, max_length=100)
     email: EmailStr
     phone: str = Field(min_length=5, max_length=32)
-    password: str = Field(min_length=10, max_length=72)
+    password: Optional[str] = Field(default=None, max_length=72)
     face_enrollment_samples_b64: list[str] = Field(min_length=5, max_length=5)
+    supabase_uid: Optional[str] = None
 
 
 class LoginPayload(BaseModel):
@@ -371,14 +495,20 @@ class ProfilePayload(BaseModel):
     checkin_interval: int = Field(ge=7, le=365)
 
 
+class FaceEnrollmentPayload(BaseModel):
+    face_enrollment_samples_b64: list[str] = Field(min_length=5, max_length=5)
+
+
 class CreateInvitationPayload(BaseModel):
     role: Literal["nominee", "recipient"]
     target_id: StrictInt = Field(gt=0)
 
 
 class ClaimInvitationPayload(BaseModel):
-    token: str = Field(min_length=43, max_length=256)
+    token: str = Field(min_length=1, max_length=256)
     password: Optional[str] = Field(default=None, min_length=10, max_length=72)
+    email: Optional[str] = None
+    role: Optional[str] = None
 
 
 class ReleasePayload(BaseModel):
@@ -717,6 +847,31 @@ def recipient_principal(
 ) -> dict:
     if not credentials:
         raise HTTPException(status_code=401, detail="A valid recipient sign-in is required.")
+    supabase_payload = verify_supabase_jwt(credentials.credentials)
+    if supabase_payload:
+        email = str(supabase_payload.get("email", "")).strip().lower()
+        sub = str(supabase_payload.get("sub", "")).strip()
+        with db() as connection:
+            row = connection.execute(
+                """SELECT recipients.id AS recipient_id, recipients.name, recipients.email, recipients.owner_id,
+                          users.name AS owner_name
+                   FROM recipients
+                   JOIN users ON users.id = recipients.owner_id
+                   WHERE LOWER(recipients.email) = ?""",
+                (email,),
+            ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=403, detail="This account is not authorized as a recipient.")
+        return {
+            "email": email,
+            "name": row["name"],
+            "role": "recipient",
+            "owner_id": row["owner_id"],
+            "owner_name": row["owner_name"],
+            "recipient_id": row["recipient_id"],
+            "session_id": f"supabase-{sub}",
+        }
+
     try:
         payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=["HS256"])
         if payload.get("principal_type") != "recipient":
@@ -744,7 +899,7 @@ def recipient_principal(
             row is None
             or row["revoked_at"] is not None
             or row["email"].strip().lower() != email
-            or datetime.fromisoformat(row["expires_at"]) <= utc_now()
+            or _parse_iso_utc(row["expires_at"]) <= utc_now()
         ):
             raise HTTPException(status_code=401, detail="The recipient sign-in is no longer active.")
         return {
@@ -763,6 +918,31 @@ def nominee_principal(
 ) -> dict:
     if not credentials:
         raise HTTPException(status_code=401, detail="A valid nominee sign-in is required.")
+    supabase_payload = verify_supabase_jwt(credentials.credentials)
+    if supabase_payload:
+        email = str(supabase_payload.get("email", "")).strip().lower()
+        sub = str(supabase_payload.get("sub", "")).strip()
+        with db() as connection:
+            row = connection.execute(
+                """SELECT nominees.id AS nominee_id, nominees.name, nominees.email, nominees.owner_id,
+                          users.name AS owner_name
+                   FROM nominees
+                   JOIN users ON users.id = nominees.owner_id
+                   WHERE LOWER(nominees.email) = ?""",
+                (email,),
+            ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=403, detail="This account is not authorized as a nominee.")
+        return {
+            "email": email,
+            "name": row["name"],
+            "role": "nominee",
+            "owner_id": row["owner_id"],
+            "owner_name": row["owner_name"],
+            "nominee_id": row["nominee_id"],
+            "session_id": f"supabase-{sub}",
+        }
+
     try:
         payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=["HS256"])
         if payload.get("principal_type") != "nominee":
@@ -790,7 +970,7 @@ def nominee_principal(
             row is None
             or row["revoked_at"] is not None
             or row["email"].strip().lower() != email
-            or datetime.fromisoformat(row["expires_at"]) <= utc_now()
+            or _parse_iso_utc(row["expires_at"]) <= utc_now()
         ):
             raise HTTPException(status_code=401, detail="The nominee sign-in is no longer active.")
         return {
@@ -809,6 +989,14 @@ def reviewer_principal(
 ) -> dict:
     if not credentials:
         raise HTTPException(status_code=401, detail="A valid reviewer sign-in is required.")
+    supabase_payload = verify_supabase_jwt(credentials.credentials)
+    if supabase_payload:
+        email = str(supabase_payload.get("email", "")).strip().lower()
+        sub = str(supabase_payload.get("sub", "")).strip()
+        if not REVIEWER_EMAIL or email != REVIEWER_EMAIL:
+            raise HTTPException(status_code=403, detail="This account is not authorized as a reviewer.")
+        return {"email": email, "session_id": f"supabase-{sub}", "role": "reviewer"}
+
     try:
         payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=["HS256"])
         if payload.get("principal_type") != "reviewer":
@@ -829,7 +1017,7 @@ def reviewer_principal(
         or row["revoked_at"] is not None
         or row["email"].strip().lower() != email
         or email != REVIEWER_EMAIL
-        or datetime.fromisoformat(row["expires_at"]) <= utc_now()
+        or _parse_iso_utc(row["expires_at"]) <= utc_now()
     ):
         raise HTTPException(status_code=401, detail="The reviewer sign-in is no longer active.")
     return {"email": email, "session_id": row["id"], "role": "reviewer"}
@@ -872,7 +1060,7 @@ def guest_principal(
             or row["invitation_revoked_at"] is not None
             or row["status"] != "claimed"
             or row["email"].strip().lower() != email
-            or datetime.fromisoformat(row["session_expires_at"]) <= utc_now()
+            or _parse_iso_utc(row["session_expires_at"]) <= utc_now()
         ):
             raise HTTPException(status_code=401, detail="The invitation sign-in is no longer active.")
         try:
@@ -919,6 +1107,39 @@ def current_user(
 ) -> sqlite3.Row:
     if not credentials:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Please sign in to continue.")
+
+    supabase_payload = verify_supabase_jwt(credentials.credentials)
+    if supabase_payload:
+        email = str(supabase_payload.get("email", "")).strip().lower()
+        sub = str(supabase_payload.get("sub", "")).strip()
+        token_id = str(supabase_payload.get("jti", sub))
+        with db() as connection:
+            revoked = connection.execute(
+                "SELECT 1 FROM revoked_tokens WHERE token_id = ?",
+                (token_id,),
+            ).fetchone()
+            if revoked:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Your session is no longer active. Please sign in again.",
+                )
+            user = connection.execute(
+                "SELECT * FROM users WHERE (supabase_uid = ? AND supabase_uid IS NOT NULL) OR LOWER(email) = ?",
+                (sub, email),
+            ).fetchone()
+            if user and ("supabase_uid" in user.keys() and not user["supabase_uid"]):
+                connection.execute(
+                    "UPDATE users SET supabase_uid = ? WHERE id = ?",
+                    (sub, user["id"]),
+                )
+                user = connection.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
+        if user is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="No CloudGuard vault profile found for this account. Please complete registration.",
+            )
+        return user
+
     try:
         payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=["HS256"])
         if payload.get("principal_type", "owner") != "owner":
@@ -966,30 +1187,69 @@ def send_invitation_email(email: str, role: str, token: str) -> str:
     resend.api_key = api_key
     claim_url = f"{app_url}/#guest-invitation={token}"
     role_label = "Trusted Nominee" if role == "nominee" else "Authorized Recipient"
+    article = "an" if role_label.startswith("A") else "a"
+    text_content = (
+        f"You have been invited to CloudGuard as {article} {role_label}.\n\n"
+        f"CloudGuard is a digital-legacy document vault for securing important personal and legal records.\n\n"
+        f"CloudGuard Application: {app_url}\n\n"
+        "Open this secure, single-use link within 7 days to verify this email address"
+        + (
+            f" and create a password for your {role} account:\n"
+            if role in {"recipient", "nominee"}
+            else ":\n"
+        )
+        + f"{claim_url}\n\n"
+        "Security & Access Boundary Notice:\n"
+        "- Accepting this invitation verifies your email address and creates your account.\n"
+        "- Accepting this invitation does NOT grant access to documents by itself.\n"
+        "- Assigned files stay locked until the owner completes and approves release.\n"
+        "- Missed owner check-ins never release documents automatically.\n\n"
+        "If you did not expect this invitation, you can safely ignore this email."
+    )
+    html_content = (
+        f"<div style=\"font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 580px; margin: 0 auto; padding: 24px; color: #252b3a; line-height: 1.6;\">"
+        f"<div style=\"background: #272550; padding: 22px; border-radius: 12px; margin-bottom: 24px; text-align: center;\">"
+        f"<h1 style=\"color: #ffffff; margin: 0; font-size: 22px; font-weight: 700; letter-spacing: -0.5px;\">CloudGuard<span style=\"color: #928bf5;\">.</span></h1>"
+        f"<p style=\"color: #c1c0d7; margin: 6px 0 0; font-size: 13px;\">Digital-Legacy Document Vault</p>"
+        f"</div>"
+        f"<h2 style=\"color: #252b3a; font-size: 18px; margin-top: 0;\">You have been invited as {article} {role_label}</h2>"
+        f"<p>You have been invited to join CloudGuard as {article} <strong>{role_label}</strong>. "
+        f"CloudGuard provides secure, encrypted digital-legacy vault storage for essential records and documents.</p>"
+        f"<div style=\"text-align: center; margin: 28px 0;\">"
+        f"<a href=\"{claim_url}\" style=\"background: #5c57d9; color: #ffffff; text-decoration: none; padding: 12px 24px; border-radius: 8px; font-weight: 600; font-size: 14px; display: inline-block;\">Accept Invitation & Set Up Account</a>"
+        f"</div>"
+        f"<p style=\"font-size: 12px; color: #7f8799; word-break: break-all;\">If the button above does not work, open this single-use link in your browser:<br /><a href=\"{claim_url}\" style=\"color: #5c57d9;\">{claim_url}</a></p>"
+        f"<p style=\"font-size: 12px; color: #7f8799;\">This invitation is valid for 7 days and can only be used once.</p>"
+        f"<div style=\"background: #f7f8fc; border-left: 4px solid #5c57d9; padding: 12px 16px; margin: 24px 0; border-radius: 4px;\">"
+        f"<strong style=\"font-size: 12px; color: #252b3a;\">Security & Access Notice:</strong>"
+        f"<ul style=\"font-size: 12px; color: #7f8799; margin: 6px 0 0; padding-left: 20px;\">"
+        f"<li>Accepting this invitation verifies your email address and creates your account.</li>"
+        f"<li>Accepting does <strong>not</strong> grant immediate access to documents.</li>"
+        f"<li>Assigned files remain encrypted and locked until the account owner explicitly approves release.</li>"
+        f"<li>Missed owner check-ins never release documents automatically.</li>"
+        f"</ul>"
+        f"</div>"
+        f"<hr style=\"border: none; border-top: 1px solid #eceef4; margin: 24px 0;\" />"
+        f"<p style=\"font-size: 11px; color: #a1a7b5; text-align: center;\">CloudGuard Vault: <a href=\"{app_url}\" style=\"color: #5c57d9;\">{app_url}</a><br />If you were not expecting this invitation, you can safely ignore this email.</p>"
+        f"</div>"
+    )
     response = resend.Emails.send(
         {
             "from": sender,
             "to": [email],
-            "subject": "You have been invited to CloudGuard",
-            "text": (
-                f"You have been invited to CloudGuard as a {role_label}.\n\n"
-                "Open this secure, single-use link within 7 days to verify this email address"
-                + (
-                    f" and create a password for your {role} account:\n"
-                    if role in {"recipient", "nominee"}
-                    else ":\n"
-                )
-                + f"{claim_url}\n\n"
-                "Accepting this invitation does not grant access to documents. "
-                "Assigned files stay locked until the owner completes and approves release. "
-                "Missed owner check-ins never release documents automatically."
-            ),
+            "subject": f"You have been invited to CloudGuard as {article} {role_label}",
+            "text": text_content,
+            "html": html_content,
         }
     )
-    provider_id = response.get("id") if isinstance(response, dict) else None
-    if not isinstance(provider_id, str) or not provider_id:
+    provider_id = (
+        response.get("id")
+        if isinstance(response, dict)
+        else getattr(response, "id", None)
+    )
+    if not isinstance(provider_id, str) or not provider_id.strip():
         raise RuntimeError("Resend did not confirm acceptance of the invitation email.")
-    return provider_id
+    return provider_id.strip()
 
 
 def invitation_email_configuration() -> tuple[dict[str, str], list[str]]:
@@ -1073,7 +1333,7 @@ def create_invitation(
         audit(connection, user["id"], f"invitation.created:{invitation_id}:{payload.role}")
 
     try:
-        send_invitation_email(email, payload.role, invitation_token)
+        provider_id = send_invitation_email(email, payload.role, invitation_token)
     except ResendError as error:
         safe_detail = sanitized_resend_error(
             error,
@@ -1132,9 +1392,14 @@ def create_invitation(
             "status": "sent",
             "expires_at": expires_at.isoformat(),
             "claim_url": claim_url,
+            "provider_id": provider_id,
         },
         "claim_url": claim_url,
-        "message": "Invitation email sent. The recipient can use the single-use link to create their account.",
+        "message": (
+            "Invitation email accepted by Resend for delivery. "
+            "Note: Provider acceptance confirms the send request was received, "
+            "but final delivery depends on the recipient's mail provider."
+        ),
     }
 
 @app.get("/api/invitations")
@@ -1148,7 +1413,7 @@ def list_invitations(user: sqlite3.Row = Depends(current_user)) -> dict:
     invitations = []
     for row in rows:
         item = dict(row)
-        if item["status"] == "sent" and datetime.fromisoformat(item["expires_at"]) <= utc_now():
+        if item["status"] == "sent" and _parse_iso_utc(item["expires_at"]) <= utc_now():
             item["status"] = "expired"
         invitations.append(item)
     return {"invitations": invitations}
@@ -1189,7 +1454,7 @@ def revoke_invitation(invitation_id: int, user: sqlite3.Row = Depends(current_us
 @app.get("/api/guest/invitations/preview")
 def preview_invitation(token: str) -> dict:
     if not token or len(token) < 43:
-        raise HTTPException(status_code=400, detail="This invitation is invalid, expired, or already used.")
+        raise HTTPException(status_code=400, detail="This invitation link is invalid.")
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
     now = utc_now()
     with db() as connection:
@@ -1198,18 +1463,33 @@ def preview_invitation(token: str) -> dict:
                FROM invitations WHERE token_hash=?""",
             (token_hash,),
         ).fetchone()
-        if (
-            invitation is None
-            or invitation["status"] != "sent"
-            or invitation["revoked_at"] is not None
-            or datetime.fromisoformat(invitation["expires_at"]) <= now
-        ):
-            raise HTTPException(status_code=400, detail="This invitation is invalid, expired, or already used.")
+        if invitation is None:
+            raise HTTPException(status_code=400, detail="This invitation link is invalid.")
+        if invitation["revoked_at"] is not None or invitation["status"] == "revoked":
+            raise HTTPException(status_code=400, detail="This invitation has been revoked by the vault owner.")
+        if _parse_iso_utc(invitation["expires_at"]) <= now:
+            raise HTTPException(status_code=400, detail="This invitation has expired. Contact the vault owner for a new invitation.")
+        if invitation["status"] == "claimed":
+            raise HTTPException(status_code=400, detail="This invitation has already been accepted. Sign in with your email and password.")
+        if invitation["status"] != "sent":
+            raise HTTPException(status_code=400, detail="This invitation is no longer active.")
         try:
             invitation_target(connection, invitation["owner_id"], invitation["role"], invitation["target_id"])
         except HTTPException as error:
             raise HTTPException(status_code=400, detail="This invitation is no longer valid.") from error
         owner = connection.execute("SELECT name FROM users WHERE id=?", (invitation["owner_id"],)).fetchone()
+        existing_account = False
+        if invitation["role"] == "recipient":
+            acct = connection.execute(
+                "SELECT id FROM recipient_accounts WHERE recipient_id=?", (invitation["target_id"],)
+            ).fetchone()
+            existing_account = acct is not None
+        elif invitation["role"] == "nominee":
+            acct = connection.execute(
+                "SELECT id FROM nominee_accounts WHERE nominee_id=?", (invitation["target_id"],)
+            ).fetchone()
+            existing_account = acct is not None
+
     email = invitation["email"].strip().lower()
     local, _, domain = email.partition("@")
     hint = f"{local[:1]}***@{domain}" if domain else "***"
@@ -1218,11 +1498,14 @@ def preview_invitation(token: str) -> dict:
         "owner_name": owner["name"] if owner else "CloudGuard owner",
         "email_hint": hint,
         "requires_password": invitation["role"] in {"recipient", "nominee"},
+        "existing_account": existing_account,
     }
 
 
 @app.post("/api/guest/invitations/claim")
 def claim_invitation(payload: ClaimInvitationPayload) -> dict:
+    if not payload.token or len(payload.token) < 43:
+        raise HTTPException(status_code=400, detail="This invitation link is invalid.")
     token_hash = hashlib.sha256(payload.token.encode("utf-8")).hexdigest()
     now = utc_now()
     session_id = secrets.token_urlsafe(24)
@@ -1233,13 +1516,16 @@ def claim_invitation(payload: ClaimInvitationPayload) -> dict:
                FROM invitations WHERE token_hash=?""",
             (token_hash,),
         ).fetchone()
-        if (
-            invitation is None
-            or invitation["status"] != "sent"
-            or invitation["revoked_at"] is not None
-            or datetime.fromisoformat(invitation["expires_at"]) <= now
-        ):
-            raise HTTPException(status_code=400, detail="This invitation is invalid, expired, or already used.")
+        if invitation is None:
+            raise HTTPException(status_code=400, detail="This invitation link is invalid.")
+        if invitation["revoked_at"] is not None or invitation["status"] == "revoked":
+            raise HTTPException(status_code=400, detail="This invitation has been revoked by the vault owner.")
+        if _parse_iso_utc(invitation["expires_at"]) <= now:
+            raise HTTPException(status_code=400, detail="This invitation has expired. Contact the vault owner for a new invitation.")
+        if invitation["status"] == "claimed":
+            raise HTTPException(status_code=400, detail="This invitation has already been accepted. Sign in with your email and password.")
+        if invitation["status"] != "sent":
+            raise HTTPException(status_code=400, detail="This invitation is no longer active.")
         try:
             target = invitation_target(
                 connection,
@@ -1252,24 +1538,37 @@ def claim_invitation(payload: ClaimInvitationPayload) -> dict:
         email = invitation["email"].strip().lower()
         if target["email"].strip().lower() != email:
             raise HTTPException(status_code=400, detail="This invitation is no longer valid.")
+
+        if payload.email is not None and payload.email.strip().lower() != email:
+            raise HTTPException(
+                status_code=403,
+                detail="The invitation email address does not match the provided email.",
+            )
+        if payload.role is not None and payload.role.strip().lower() != invitation["role"]:
+            raise HTTPException(
+                status_code=403,
+                detail="The invitation role does not match the provided role.",
+            )
+
         if invitation["role"] in {"recipient", "nominee"} and not payload.password:
             raise HTTPException(
                 status_code=422,
                 detail=f"Create a password of at least 10 characters to finish setting up your {invitation['role']} account.",
             )
 
-        session_expires_at = min(now + timedelta(hours=12), datetime.fromisoformat(invitation["expires_at"]))
+        session_expires_at = min(now + timedelta(hours=12), _parse_iso_utc(invitation["expires_at"]))
         updated = connection.execute(
             """UPDATE invitations SET status='claimed',claimed_at=?
                WHERE id=? AND status='sent' AND revoked_at IS NULL""",
             (now.isoformat(), invitation["id"]),
         )
         if updated.rowcount != 1:
-            raise HTTPException(status_code=400, detail="This invitation is invalid, expired, or already used.")
+            raise HTTPException(status_code=400, detail="This invitation has already been accepted. Sign in with your email and password.")
         owner = connection.execute(
             "SELECT name FROM users WHERE id=?", (invitation["owner_id"],)
         ).fetchone()
         audit(connection, invitation["owner_id"], f"invitation.claimed:{invitation['id']}:{invitation['role']}")
+
 
         if invitation["role"] == "recipient":
             password_hash = _password_hash(payload.password)
@@ -1936,12 +2235,9 @@ def recipient_history(recipient: dict = Depends(recipient_principal)) -> dict:
     return {"events": [dict(row) for row in rows]}
 
 
-@app.post("/api/auth/register", status_code=201)
-def register(payload: RegisterPayload) -> dict:
-    if len(payload.password.encode("utf-8")) > 72:
-        raise HTTPException(status_code=422, detail="Password must be 72 bytes or fewer.")
+def validate_and_encrypt_face_enrollment(samples: list[str]) -> bytes:
     decoded_samples = []
-    for encoded_sample in payload.face_enrollment_samples_b64:
+    for encoded_sample in samples:
         if len(encoded_sample) > 3 * 1024 * 1024:
             raise HTTPException(status_code=413, detail="Each face sample must be 2 MB or smaller.")
         try:
@@ -1953,19 +2249,36 @@ def register(payload: RegisterPayload) -> dict:
         if not (raw.startswith(b"\xff\xd8\xff") or raw.startswith(b"\x89PNG\r\n\x1a\n")):
             raise HTTPException(status_code=422, detail="Each face sample must be a JPEG or PNG image.")
         decoded_samples.append(encoded_sample)
-    face_blob = encrypt_bytes(json.dumps(decoded_samples, separators=(",", ":")).encode("ascii"))
+    return encrypt_bytes(json.dumps(decoded_samples, separators=(",", ":")).encode("ascii"))
+
+
+@app.post("/api/auth/register", status_code=201)
+def register(payload: RegisterPayload) -> dict:
+    face_blob = validate_and_encrypt_face_enrollment(payload.face_enrollment_samples_b64)
+    email = payload.email.strip().lower()
+
+    if payload.supabase_uid:
+        pwd_hash = b"*SUPABASE_AUTH*"
+    else:
+        if not payload.password or len(payload.password) < 10:
+            raise HTTPException(status_code=422, detail="Password must be at least 10 characters.")
+        if len(payload.password.encode("utf-8")) > 72:
+            raise HTTPException(status_code=422, detail="Password must be 72 bytes or fewer.")
+        pwd_hash = bcrypt.hashpw(payload.password.encode("utf-8"), bcrypt.gensalt())
+
     try:
         with db() as connection:
             cursor = connection.execute(
-                """INSERT INTO users(name,email,phone,password_hash,face_enrollment,created_at)
-                   VALUES(?,?,?,?,?,?)""",
+                """INSERT INTO users(name,email,phone,password_hash,face_enrollment,created_at,supabase_uid)
+                   VALUES(?,?,?,?,?,?,?)""",
                 (
                     payload.name.strip(),
-                    payload.email.strip().lower(),
+                    email,
                     payload.phone.strip(),
-                    bcrypt.hashpw(payload.password.encode("utf-8"), bcrypt.gensalt()),
+                    pwd_hash,
                     face_blob,
                     utc_now().isoformat(),
+                    payload.supabase_uid.strip() if payload.supabase_uid else None,
                 ),
             )
             user_id = cursor.lastrowid
@@ -1996,6 +2309,23 @@ def logout(
     credentials: HTTPAuthorizationCredentials = Depends(security),
     user: sqlite3.Row = Depends(current_user),
 ) -> None:
+    supabase_payload = verify_supabase_jwt(credentials.credentials)
+    if supabase_payload:
+        token_id = str(supabase_payload.get("jti", supabase_payload.get("sub", "")))
+        exp = supabase_payload.get("exp")
+        exp_iso = (
+            datetime.fromtimestamp(exp, timezone.utc).isoformat()
+            if exp
+            else (utc_now() + timedelta(days=1)).isoformat()
+        )
+        with db() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO revoked_tokens(token_id, user_id, revoked_at, expires_at) VALUES(?,?,?,?)",
+                (token_id, user["id"], utc_now().isoformat(), exp_iso),
+            )
+            audit(connection, user["id"], "account.signed_out")
+        return
+
     payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=["HS256"])
     with db() as connection:
         connection.execute(
@@ -2008,6 +2338,64 @@ def logout(
 @app.get("/api/auth/me")
 def me(user: sqlite3.Row = Depends(current_user)) -> dict:
     return {"user": public_user(user)}
+
+
+@app.get("/api/auth/status")
+def auth_status(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> dict:
+    if not credentials:
+        return {"authenticated": False, "error": "No credentials provided."}
+    raw_token = credentials.credentials
+    if not SUPABASE_JWT_SECRET:
+        return {
+            "authenticated": False,
+            "has_vault_profile": False,
+            "error": "SUPABASE_JWT_SECRET is not configured in backend/.env. Please configure the JWT Secret from your Supabase Dashboard.",
+        }
+    try:
+        supabase_payload = verify_supabase_jwt(raw_token)
+    except HTTPException as exc:
+        return {
+            "authenticated": False,
+            "has_vault_profile": False,
+            "error": f"Supabase token verification failed: {exc.detail}",
+        }
+    except Exception as exc:
+        return {
+            "authenticated": False,
+            "has_vault_profile": False,
+            "error": f"Token verification error: {str(exc)}",
+        }
+
+    if supabase_payload:
+        email = str(supabase_payload.get("email", "")).strip().lower()
+        sub = str(supabase_payload.get("sub", "")).strip()
+        with db() as connection:
+            user = connection.execute(
+                "SELECT * FROM users WHERE (supabase_uid = ? AND supabase_uid IS NOT NULL) OR LOWER(email) = ?",
+                (sub, email),
+            ).fetchone()
+            if user and not user["supabase_uid"]:
+                connection.execute("UPDATE users SET supabase_uid = ? WHERE id = ?", (sub, user["id"]))
+                user = connection.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
+
+        return {
+            "authenticated": True,
+            "provider": "supabase",
+            "email": email,
+            "supabase_uid": sub,
+            "has_vault_profile": user is not None,
+            "user": public_user(user) if user else None,
+        }
+    try:
+        user = current_user(credentials)
+        return {
+            "authenticated": True,
+            "provider": "local",
+            "has_vault_profile": True,
+            "user": public_user(user),
+        }
+    except Exception:
+        return {"authenticated": False, "error": "Invalid or expired token."}
 
 
 @app.get("/api/dashboard")
@@ -2032,7 +2420,7 @@ def dashboard(user: sqlite3.Row = Depends(current_user)) -> dict:
     next_due = None
     if last and last["status"] == "success":
         next_due = (
-            datetime.fromisoformat(last["created_at"]) + timedelta(days=user["checkin_interval"])
+            _parse_iso_utc(last["created_at"]) + timedelta(days=user["checkin_interval"])
         ).isoformat()
     return {
         "user": public_user(user),
@@ -2485,8 +2873,12 @@ def create_checkin(
         raise HTTPException(status_code=409, detail="Face enrollment is missing. Re-enroll your face before checking in.")
     try:
         enrollment_samples = json.loads(decrypt_bytes(owner["face_enrollment"]))
-    except (ValueError, TypeError) as error:
-        raise HTTPException(status_code=409, detail="Face enrollment data could not be read. Please contact support.") from error
+    except Exception as error:
+        logger.warning("Failed to decrypt or parse face enrollment for user %s: %s", user["id"], error)
+        raise HTTPException(
+            status_code=409,
+            detail="Face enrollment data could not be decrypted. Re-enroll your face before checking in.",
+        ) from error
     checkin_started_at = utc_now()
     with tempfile.TemporaryDirectory(prefix="cloudguard-checkin-") as directory:
         video_path = Path(directory) / f"recording{suffix}"
@@ -2534,7 +2926,7 @@ def create_checkin(
             passed
             and hold["status"] == "awaiting_checkin"
             and hold["ended_at"]
-            and checkin_started_at >= datetime.fromisoformat(hold["ended_at"])
+            and checkin_started_at >= _parse_iso_utc(hold["ended_at"])
         ):
             connection.execute(
                 "UPDATE medical_holds SET status='inactive',updated_at=? WHERE owner_id=?",
@@ -2572,3 +2964,19 @@ def update_profile(payload: ProfilePayload, user: sqlite3.Row = Depends(current_
         audit(connection, user["id"], "profile.updated")
         updated = connection.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
     return {"user": public_user(updated)}
+
+
+@app.put("/api/profile/face-enrollment")
+def update_face_enrollment(
+    payload: FaceEnrollmentPayload,
+    user: sqlite3.Row = Depends(current_user),
+) -> dict:
+    face_blob = validate_and_encrypt_face_enrollment(payload.face_enrollment_samples_b64)
+    with db() as connection:
+        connection.execute(
+            "UPDATE users SET face_enrollment=? WHERE id=?",
+            (face_blob, user["id"]),
+        )
+        audit(connection, user["id"], "profile.face_enrollment_updated")
+    return {"message": "Face enrollment updated successfully."}
+

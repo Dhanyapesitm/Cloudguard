@@ -1,4 +1,15 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
+import {
+  isSupabaseConfigured,
+  getSupabaseConfigError,
+  signInWithEmailPassword,
+  signUpWithEmailPassword,
+  signOutSupabase,
+  requestPasswordReset,
+  updateUserPassword,
+  getSupabaseSession,
+  onSupabaseAuthStateChange,
+} from './supabase'
 
 const API_URL = import.meta.env.VITE_API_URL || '/api'
 const NAV_ITEMS = [
@@ -108,8 +119,9 @@ function accessStatusLabel(status) {
   return { pending: 'Pending', available: 'Available', revoked: 'Revoked', on_hold: 'On hold' }[status] || status
 }
 
-function GuestInvitationClaim({ invitationToken, onClaim }) {
+function GuestInvitationClaim({ invitationToken, onClaim, onCancel }) {
   const [error, setError] = useState('')
+  const [previewLoading, setPreviewLoading] = useState(true)
   const [loading, setLoading] = useState(false)
   const [preview, setPreview] = useState(null)
   const [password, setPassword] = useState('')
@@ -117,9 +129,23 @@ function GuestInvitationClaim({ invitationToken, onClaim }) {
   const [showPassword, setShowPassword] = useState(false)
 
   useEffect(() => {
+    let active = true
+    setPreviewLoading(true)
+    setError('')
     api(`/guest/invitations/preview?token=${encodeURIComponent(invitationToken)}`)
-      .then(setPreview)
-      .catch((requestError) => setError(requestError.message))
+      .then((data) => {
+        if (active) {
+          setPreview(data)
+          setPreviewLoading(false)
+        }
+      })
+      .catch((requestError) => {
+        if (active) {
+          setError(requestError.message)
+          setPreviewLoading(false)
+        }
+      })
+    return () => { active = false }
   }, [invitationToken])
 
   async function claim(event) {
@@ -128,6 +154,10 @@ function GuestInvitationClaim({ invitationToken, onClaim }) {
     if (preview?.requires_password) {
       if (password.length < 10) {
         setError('Create a password of at least 10 characters.')
+        return
+      }
+      if (password.length > 72) {
+        setError('Password must not exceed 72 characters.')
         return
       }
       if (password !== confirmPassword) {
@@ -151,26 +181,139 @@ function GuestInvitationClaim({ invitationToken, onClaim }) {
     }
   }
 
+  const roleLabel = preview?.role === 'nominee' ? 'Trusted Nominee' : 'Authorized Recipient'
   const accountInvite = preview?.requires_password
-  const inviteRole = preview?.role === 'nominee' ? 'nominee' : 'recipient'
-  return <main className="auth-page"><section className="auth-main"><div className="auth-card">
-    <div className="auth-heading"><span className="eyebrow">CLOUDGUARD INVITATION</span><h2>{accountInvite ? `Create your ${inviteRole} account` : 'Verify your invited email'}</h2><p>{accountInvite ? `Verify ${preview.email_hint} and create a password to sign in. ${inviteRole === 'nominee' ? 'Your nominee role does not grant document access.' : 'This does not unlock documents.'}` : 'Continue from the invitation email to confirm you control its intended address. This link can only be used once.'}</p></div>
-    {error && <div className="notice notice-error" role="alert">{error}</div>}
-    <div className="notice notice-warm"><span className="notice-icon"><Icon name="lock" size={17} /></span><span><b>Invitation does not grant document access</b><small>Assigned files stay locked until the owner completes and approves release. Missed owner check-ins never release documents automatically.</small></span></div>
-    <form className="form-stack" onSubmit={claim}>
-      {accountInvite && <>
-        <label>Password
-          <span className="password-wrap">
-            <input value={password} onChange={(event) => setPassword(event.target.value)} type={showPassword ? 'text' : 'password'} placeholder="At least 10 characters" autoComplete="new-password" required minLength="10" />
-            <button type="button" className="password-toggle" onClick={() => setShowPassword(!showPassword)} aria-label={showPassword ? 'Hide password' : 'Show password'}><Icon name="eye" size={18} /></button>
-          </span>
-        </label>
-        <label>Confirm password<input value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} type={showPassword ? 'text' : 'password'} placeholder="Enter your password again" autoComplete="new-password" required minLength="10" /></label>
-      </>}
-      <button className="button button-primary" type="submit" disabled={loading || !preview}>{loading ? 'Verifying invitation...' : accountInvite ? 'Verify email and create account' : 'Verify and continue'} <Icon name="arrow" size={17} /></button>
-    </form>
-  </div></section></main>
+  const isAlreadyClaimed = error.toLowerCase().includes('already been accepted')
+
+  return (
+    <main className="auth-page">
+      <section className="auth-main">
+        <div className="auth-card">
+          {previewLoading ? (
+            <div className="auth-heading">
+              <span className="eyebrow">CLOUDGUARD INVITATION</span>
+              <h2>Checking invitation...</h2>
+              <div className="loading-line" style={{ marginTop: '1.5rem' }}>
+                <span /> Validating secure invitation link...
+              </div>
+            </div>
+          ) : error ? (
+            <>
+              <div className="auth-heading">
+                <span className="eyebrow">INVITATION NOTICE</span>
+                <h2>Invitation unable to proceed</h2>
+                <p>This single-use invitation link could not be verified.</p>
+              </div>
+              <div className={isAlreadyClaimed ? 'notice notice-warm' : 'notice notice-error'} role="alert">
+                {error}
+              </div>
+              <div style={{ marginTop: '1.25rem', display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+                <button
+                  type="button"
+                  className="button button-primary button-full"
+                  onClick={onCancel}
+                >
+                  Return to sign in <Icon name="arrow" size={17} />
+                </button>
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="auth-heading">
+                <span className="eyebrow">CLOUDGUARD INVITATION</span>
+                <h2>{preview.existing_account ? `Update password for ${roleLabel}` : `Create your ${roleLabel} account`}</h2>
+                <p>
+                  Invited by <b>{preview.owner_name}</b> for <code>{preview.email_hint}</code>.
+                  {preview.role === 'nominee'
+                    ? ' As a nominee, you can participate in verification. You do not receive document access.'
+                    : ' Document access remains locked until the owner approves release.'}
+                </p>
+              </div>
+              {preview.existing_account && (
+                <div className="notice notice-warm">
+                  <span className="notice-icon"><Icon name="lock" size={17} /></span>
+                  <span>
+                    <b>Account already exists</b>
+                    <small>An account has already been set up for this email. Enter a new password to update your credentials and accept this invitation, or sign in directly.</small>
+                  </span>
+                </div>
+              )}
+              <div className="notice notice-warm">
+                <span className="notice-icon"><Icon name="lock" size={17} /></span>
+                <span>
+                  <b>Invitation does not grant document access</b>
+                  <small>Assigned files stay locked until the owner completes and approves release. Missed owner check-ins never release documents automatically.</small>
+                </span>
+              </div>
+              {error && <div className="notice notice-error" role="alert">{error}</div>}
+              <form className="form-stack" onSubmit={claim}>
+                {accountInvite && (
+                  <>
+                    <label>
+                      {preview.existing_account ? 'New password' : 'Password'}
+                      <span className="password-wrap">
+                        <input
+                          value={password}
+                          onChange={(event) => setPassword(event.target.value)}
+                          type={showPassword ? 'text' : 'password'}
+                          placeholder="At least 10 characters"
+                          autoComplete="new-password"
+                          required
+                          minLength="10"
+                          maxLength="72"
+                        />
+                        <button
+                          type="button"
+                          className="password-toggle"
+                          onClick={() => setShowPassword(!showPassword)}
+                          aria-label={showPassword ? 'Hide password' : 'Show password'}
+                        >
+                          <Icon name="eye" size={18} />
+                        </button>
+                      </span>
+                    </label>
+                    <label>
+                      {preview.existing_account ? 'Confirm new password' : 'Confirm password'}
+                      <input
+                        value={confirmPassword}
+                        onChange={(event) => setConfirmPassword(event.target.value)}
+                        type={showPassword ? 'text' : 'password'}
+                        placeholder="Enter your password again"
+                        autoComplete="new-password"
+                        required
+                        minLength="10"
+                        maxLength="72"
+                      />
+                    </label>
+                  </>
+                )}
+                <button className="button button-primary" type="submit" disabled={loading}>
+                  {loading
+                    ? 'Verifying invitation...'
+                    : preview.existing_account
+                      ? 'Update password and accept'
+                      : 'Verify email and create account'}{' '}
+                  <Icon name="arrow" size={17} />
+                </button>
+              </form>
+              <div style={{ marginTop: '1rem', textAlign: 'center' }}>
+                <button
+                  type="button"
+                  className="text-button"
+                  onClick={onCancel}
+                  style={{ fontSize: '13px', color: 'var(--text-muted, #707584)' }}
+                >
+                  Already have your password? Sign in instead
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      </section>
+    </main>
+  )
 }
+
 
 function GuestSession({ token, onSignOut }) {
   const [guest, setGuest] = useState(null)
@@ -641,7 +784,7 @@ function ReviewerPortal({ token, onSignOut }) {
   </div>
 }
 
-function AuthScreen({ onLogin, onRecipientLogin, onNomineeLogin, onReviewerLogin, systemNotice }) {
+function AuthScreen({ onLogin, onRecipientLogin, onNomineeLogin, onReviewerLogin, systemNotice, onClearSystemNotice }) {
   const [mode, setMode] = useState('login')
   const [showPassword, setShowPassword] = useState(false)
   const [showConfirm, setShowConfirm] = useState(false)
@@ -655,6 +798,19 @@ function AuthScreen({ onLogin, onRecipientLogin, onNomineeLogin, onReviewerLogin
   const videoRef = useRef(null)
   const streamRef = useRef(null)
   const cancelCaptureRef = useRef(false)
+
+  // Listen to recovery hashes or email confirmation in URL
+  useEffect(() => {
+    const hash = window.location.hash || ''
+    if (hash.includes('type=recovery')) {
+      setMode('recovery')
+      setNotice('Password recovery link verified. Please choose a new password.')
+    } else if (hash.includes('email-confirmed=true') || hash.includes('type=signup')) {
+      setNotice('Your email has been confirmed! Please sign in to your vault.')
+      setMode('login')
+      window.history.replaceState(null, '', window.location.pathname)
+    }
+  }, [])
 
   useEffect(() => () => {
     cancelCaptureRef.current = true
@@ -742,54 +898,172 @@ function AuthScreen({ onLogin, onRecipientLogin, onNomineeLogin, onReviewerLogin
     event.preventDefault()
     setError('')
     setNotice('')
+    onClearSystemNotice?.()
     const formElement = event.currentTarget
     const form = new FormData(formElement)
-    const email = form.get('email')
-    const password = form.get('password')
+    const email = form.get('email')?.toString().trim().toLowerCase()
+    const password = form.get('password')?.toString() || ''
     setLoading(true)
+
     try {
+      // 1. Password Reset Request Flow
+      if (mode === 'reset-request') {
+        if (!email) throw new Error('Please enter your email address.')
+        if (!isSupabaseConfigured) {
+          throw new Error('Supabase is not configured. Add VITE_SUPABASE_URL and VITE_SUPABASE_PUBLISHABLE_KEY to enable password recovery.')
+        }
+        await requestPasswordReset(email)
+        setNotice(`Password reset instructions have been sent to ${email}. Check your email inbox.`)
+        formElement.reset()
+        return
+      }
+
+      // 2. Set New Password after recovery flow
+      if (mode === 'recovery') {
+        if (!password || password.length < 10) {
+          throw new Error('Create a new password of at least 10 characters.')
+        }
+        if (password !== form.get('confirmPassword')) {
+          throw new Error('Your passwords do not match.')
+        }
+        if (!isSupabaseConfigured) {
+          throw new Error('Supabase is not configured.')
+        }
+        await updateUserPassword(password)
+        setNotice('Password updated successfully! Please sign in with your new password.')
+        setMode('login')
+        window.history.replaceState(null, '', window.location.pathname)
+        return
+      }
+
+      // 3. Register Flow
       if (mode === 'register') {
         if (password !== form.get('confirmPassword')) throw new Error('Your passwords do not match.')
+        if (password.length < 10) throw new Error('Password must be at least 10 characters.')
         if (faceSamples.length !== 5) throw new Error('Capture all 5 face samples to finish creating your account.')
-        const response = await api('/auth/register', {
-          method: 'POST',
-          body: JSON.stringify({
-            name: form.get('name'),
-            email,
-            phone: form.get('phone'),
-            password,
-            face_enrollment_samples_b64: faceSamples.map((sample) => sample.split(',')[1]),
-          }),
-        })
-        setNotice(response.message)
-        setMode('login')
-        setFaceSamples([])
-        stopEnrollmentCamera()
-        formElement.reset()
+
+        const name = form.get('name')?.toString().trim()
+        const phone = form.get('phone')?.toString().trim()
+
+        if (isSupabaseConfigured) {
+          const supabaseData = await signUpWithEmailPassword(email, password, { name, phone })
+          const supabaseUid = supabaseData.user?.id
+
+          const regResponse = await api('/auth/register', {
+            method: 'POST',
+            body: JSON.stringify({
+              name,
+              email,
+              phone,
+              face_enrollment_samples_b64: faceSamples.map((sample) => sample.split(',')[1]),
+              supabase_uid: supabaseUid,
+            }),
+          })
+
+          setFaceSamples([])
+          stopEnrollmentCamera()
+          formElement.reset()
+
+          if (!supabaseData.session) {
+            setNotice(`Account registered! A confirmation email has been sent to ${email}. Please confirm your email before signing in.`)
+            setMode('login')
+          } else {
+            onLogin({ access_token: supabaseData.session.access_token, user: regResponse.user })
+          }
+        } else {
+          const response = await api('/auth/register', {
+            method: 'POST',
+            body: JSON.stringify({
+              name,
+              email,
+              phone,
+              password,
+              face_enrollment_samples_b64: faceSamples.map((sample) => sample.split(',')[1]),
+            }),
+          })
+          setNotice(response.message)
+          setMode('login')
+          setFaceSamples([])
+          stopEnrollmentCamera()
+          formElement.reset()
+        }
       } else if (mode === 'recipient-login') {
+        if (isSupabaseConfigured) {
+          const data = await signInWithEmailPassword(email, password)
+          const tok = data.session?.access_token
+          if (!tok) throw new Error('Supabase did not return an access token. Please try again.')
+          const response = await api('/recipient/me', { token: tok })
+          onRecipientLogin({ access_token: tok, ...response })
+          return
+        }
         const response = await api('/recipient/login', {
           method: 'POST',
           body: JSON.stringify({ email, password }),
         })
         onRecipientLogin(response)
       } else if (mode === 'nominee-login') {
+        if (isSupabaseConfigured) {
+          const data = await signInWithEmailPassword(email, password)
+          const tok = data.session?.access_token
+          if (!tok) throw new Error('Supabase did not return an access token. Please try again.')
+          const response = await api('/nominee/me', { token: tok })
+          onNomineeLogin({ access_token: tok, ...response })
+          return
+        }
         const response = await api('/nominee/login', {
           method: 'POST',
           body: JSON.stringify({ email, password }),
         })
         onNomineeLogin(response)
       } else if (mode === 'reviewer-login') {
+        if (isSupabaseConfigured) {
+          const data = await signInWithEmailPassword(email, password)
+          const tok = data.session?.access_token
+          if (!tok) throw new Error('Supabase did not return an access token. Please try again.')
+          const response = await api('/reviewer/cases', { token: tok })
+          onReviewerLogin({ access_token: tok, ...response })
+          return
+        }
         const response = await api('/reviewer/login', {
           method: 'POST',
           body: JSON.stringify({ email, password }),
         })
         onReviewerLogin(response)
       } else {
-        const response = await api('/auth/login', {
-          method: 'POST',
-          body: JSON.stringify({ email, password }),
-        })
-        onLogin(response)
+        // Owner login
+        if (isSupabaseConfigured) {
+          try {
+            const data = await signInWithEmailPassword(email, password)
+            const token = data.session?.access_token
+            if (!token) throw new Error('No access token was returned by Supabase.')
+
+            const status = await api('/auth/status', { token })
+            if (!status.authenticated) {
+              throw new Error(
+                status.error ||
+                'Backend server could not verify your Supabase session. Ensure your backend server is running and SUPABASE_JWT_SECRET in backend/.env matches your Supabase Dashboard.'
+              )
+            }
+            if (!status.has_vault_profile) {
+              throw new Error('Supabase account is confirmed, but face enrollment has not been registered yet. Please click "Create an account" to complete enrollment.')
+            }
+            onLogin({ access_token: token, user: status.user })
+          } catch (sbError) {
+            if (sbError.message?.toLowerCase().includes('email not confirmed')) {
+              throw new Error(`Email confirmation is required. Please check your inbox at ${email} and confirm your address before signing in.`)
+            }
+            if (sbError.message?.toLowerCase().includes('invalid login credentials')) {
+              throw new Error('Email or password is incorrect.')
+            }
+            throw sbError
+          }
+        } else {
+          const response = await api('/auth/login', {
+            method: 'POST',
+            body: JSON.stringify({ email, password }),
+          })
+          onLogin(response)
+        }
       }
     } catch (requestError) {
       setError(requestError.message)
@@ -820,72 +1094,180 @@ function AuthScreen({ onLogin, onRecipientLogin, onNomineeLogin, onReviewerLogin
         <div className="mobile-brand brand"><span className="brand-mark"><Icon name="shield" size={20} /></span><span>cloudguard<span className="brand-period">.</span></span></div>
         <div className="auth-card">
           <div className="auth-heading">
-            <span className="eyebrow">{mode === 'recipient-login' ? 'AUTHORIZED RECIPIENT' : mode === 'nominee-login' ? 'TRUSTED NOMINEE' : mode === 'reviewer-login' ? 'AUTHORIZED REVIEWER' : mode === 'login' ? 'WELCOME BACK' : 'START YOUR VAULT'}</span>
-            <h2>{mode === 'recipient-login' ? 'Recipient sign-in' : mode === 'nominee-login' ? 'Nominee sign-in' : mode === 'reviewer-login' ? 'Reviewer sign-in' : mode === 'login' ? 'Sign in to your vault' : 'Create your account'}</h2>
-            <p>{mode.endsWith('-login') ? 'Use the password you created from your invitation or reviewer account.' : mode === 'login' ? 'Your important things are right where you left them.' : 'A few details to set up your private space.'}</p>
+            <span className="eyebrow">
+              {mode === 'recipient-login' ? 'AUTHORIZED RECIPIENT' :
+               mode === 'nominee-login' ? 'TRUSTED NOMINEE' :
+               mode === 'reviewer-login' ? 'AUTHORIZED REVIEWER' :
+               mode === 'reset-request' ? 'PASSWORD RECOVERY' :
+               mode === 'recovery' ? 'SET NEW PASSWORD' :
+               mode === 'login' ? 'WELCOME BACK' : 'START YOUR VAULT'}
+            </span>
+            <h2>
+              {mode === 'recipient-login' ? 'Recipient sign-in' :
+               mode === 'nominee-login' ? 'Nominee sign-in' :
+               mode === 'reviewer-login' ? 'Reviewer sign-in' :
+               mode === 'reset-request' ? 'Reset your password' :
+               mode === 'recovery' ? 'Create new password' :
+               mode === 'login' ? 'Sign in to your vault' : 'Create your account'}
+            </h2>
+            <p>
+              {mode === 'reset-request' ? 'Enter your email address to receive password reset instructions.' :
+               mode === 'recovery' ? 'Enter a strong password of at least 10 characters.' :
+               mode.endsWith('-login') ? 'Use the password you created from your invitation or reviewer account.' :
+               mode === 'login' ? 'Your important things are right where you left them.' : 'A few details to set up your private space.'}
+            </p>
           </div>
+
+          <div style={{ marginBottom: '14px' }}>
+            {isSupabaseConfigured ? (
+              <span className="badge" style={{ display: 'inline-flex', alignItems: 'center', gap: '5px', padding: '3px 9px', borderRadius: '12px', fontSize: '11px', fontWeight: 600, background: '#eafbf3', color: '#107e4d' }}>
+                <span style={{ width: '6px', height: '6px', borderRadius: '50%', background: '#107e4d' }} /> SUPABASE AUTH
+              </span>
+            ) : (() => {
+              const configErr = getSupabaseConfigError()
+              return configErr ? (
+                <div className="notice notice-error" role="alert" style={{ fontSize: '13px' }}>
+                  <b>Supabase not configured — </b>{configErr}
+                </div>
+              ) : (
+                <span className="badge" style={{ display: 'inline-flex', alignItems: 'center', gap: '5px', padding: '3px 9px', borderRadius: '12px', fontSize: '11px', fontWeight: 600, background: '#f1f2f6', color: '#5f697a' }}>
+                  <span style={{ width: '6px', height: '6px', borderRadius: '50%', background: '#8c95a6' }} /> LOCAL AUTH FALLBACK
+                </span>
+              )
+            })()}
+          </div>
+
           {notice && <div className="notice notice-success">{notice}</div>}
           {systemNotice && <div className="notice notice-warm">{systemNotice}</div>}
           {error && <div className="notice notice-error" role="alert">{error}</div>}
+
           <form className="form-stack" onSubmit={submit}>
-            {mode === 'register' && <>
-              <label>Full name<input name="name" type="text" placeholder="Your name" autoComplete="name" required minLength="2" /></label>
-              <div className="input-row">
-                <label>Email address<input name="email" type="email" placeholder="you@example.com" autoComplete="email" required /></label>
-                <label>Phone number<input name="phone" type="tel" placeholder="+1 (555) 000-0000" autoComplete="tel" required minLength="5" /></label>
-              </div>
-            </>}
-            {(mode === 'login' || mode === 'recipient-login') && <label>Email address<input name="email" type="email" placeholder="you@example.com" autoComplete="email" required /></label>}
-            <label>Password
-              <span className="password-wrap">
-                <input name="password" type={showPassword ? 'text' : 'password'} placeholder={mode === 'register' ? 'At least 10 characters' : 'Enter your password'} autoComplete={mode === 'register' ? 'new-password' : 'current-password'} required minLength={mode === 'register' ? 10 : 1} />
-                <button type="button" className="password-toggle" onClick={() => setShowPassword(!showPassword)} aria-label={showPassword ? 'Hide password' : 'Show password'}><Icon name="eye" size={18} /></button>
-              </span>
-            </label>
-            {mode === 'register' && <>
-              <label>Confirm password
-                <span className="password-wrap">
-                  <input name="confirmPassword" type={showConfirm ? 'text' : 'password'} placeholder="Enter your password again" autoComplete="new-password" required minLength="10" />
-                  <button type="button" className="password-toggle" onClick={() => setShowConfirm(!showConfirm)} aria-label={showConfirm ? 'Hide password' : 'Show password'}><Icon name="eye" size={18} /></button>
-                </span>
-              </label>
-              <div className="enrollment-card">
-                <div className="enrollment-heading"><span className="mini-icon"><Icon name="scan" size={17} /></span><span><b>Face enrollment</b><small>Capture five face samples for your secure profile.</small></span><span className={`sample-count ${faceSamples.length === 5 ? 'sample-count-done' : ''}`}>{faceSamples.length}/5</span></div>
-                <div className={`enrollment-camera ${cameraOpen ? 'enrollment-camera-active' : 'enrollment-camera-idle'}`}>
-                  <div className="enrollment-preview">
-                    <video className="enrollment-live-video" ref={videoRef} muted playsInline />
-                    {cameraOpen && <><div className="face-guide"><span>Center your face here</span></div><span className="camera-live-label"><span className="live-dot" /> LIVE PREVIEW</span></>}
-                  </div>
-                  {cameraOpen && <>
-                    <p className="camera-instructions">Look at the camera, keep your face inside the guide, and use even lighting. Five samples will be captured automatically.</p>
-                    <div className="button-row">
-                      <button type="button" className="button button-primary button-small" onClick={captureEnrollmentSamples} disabled={capturing}>{capturing ? `Capturing ${captureProgress}/5...` : 'Capture 5 samples'}</button>
-                      <button type="button" className="button button-quiet button-small" onClick={stopEnrollmentCamera} disabled={capturing}>Cancel</button>
+            {mode === 'reset-request' && (
+              <>
+                <label>Email address
+                  <input name="email" type="email" placeholder="you@example.com" autoComplete="email" required />
+                </label>
+                <button className="button button-primary button-full" type="submit" disabled={loading}>
+                  {loading ? 'Sending link...' : 'Send reset instructions'}<Icon name="arrow" size={17} />
+                </button>
+              </>
+            )}
+
+            {mode === 'recovery' && (
+              <>
+                <label>New password
+                  <span className="password-wrap">
+                    <input name="password" type={showPassword ? 'text' : 'password'} placeholder="At least 10 characters" autoComplete="new-password" required minLength={10} />
+                    <button type="button" className="password-toggle" onClick={() => setShowPassword(!showPassword)} aria-label={showPassword ? 'Hide password' : 'Show password'}><Icon name="eye" size={18} /></button>
+                  </span>
+                </label>
+                <label>Confirm new password
+                  <span className="password-wrap">
+                    <input name="confirmPassword" type={showConfirm ? 'text' : 'password'} placeholder="Confirm your new password" autoComplete="new-password" required minLength={10} />
+                    <button type="button" className="password-toggle" onClick={() => setShowConfirm(!showConfirm)} aria-label={showConfirm ? 'Hide password' : 'Show password'}><Icon name="eye" size={18} /></button>
+                  </span>
+                </label>
+                <button className="button button-primary button-full" type="submit" disabled={loading}>
+                  {loading ? 'Updating password...' : 'Save new password'}<Icon name="arrow" size={17} />
+                </button>
+              </>
+            )}
+
+            {mode !== 'reset-request' && mode !== 'recovery' && (
+              <>
+                {mode === 'register' && (
+                  <>
+                    <label>Full name<input name="name" type="text" placeholder="Your name" autoComplete="name" required minLength="2" /></label>
+                    <div className="input-row">
+                      <label>Email address<input name="email" type="email" placeholder="you@example.com" autoComplete="email" required /></label>
+                      <label>Phone number<input name="phone" type="tel" placeholder="+1 (555) 000-0000" autoComplete="tel" required minLength="5" /></label>
                     </div>
-                    {capturing && <div className="capture-progress" aria-label={`${captureProgress} of 5 samples captured`}><span style={{ width: `${captureProgress * 20}%` }} /></div>}
-                  </>}
-                </div>
-                {!cameraOpen && faceSamples.length < 5 && <div className="enrollment-start">
-                  <p>{faceSamples.length ? `${faceSamples.length} of 5 captured. You can capture the remaining samples.` : 'Open the camera to see your live preview before taking samples.'}</p>
-                  <button type="button" className="button button-secondary button-small" onClick={openEnrollmentCamera}>Open camera</button>
-                </div>}
-                {faceSamples.length > 0 && <div className="sample-strip">
-                  {faceSamples.map((sample, index) => <div className="sample-thumb" key={`${index}-${sample.length}`}><img src={sample} alt={`Face enrollment sample ${index + 1}`} /><span>{String(index + 1).padStart(2, '0')}</span></div>)}
-                  {faceSamples.length === 5 && <button type="button" className="text-button recapture-button" onClick={() => { setFaceSamples([]); setCaptureProgress(0); openEnrollmentCamera() }}>Retake all</button>}
-                </div>}
-              </div>
-              <p className="field-hint">Your live preview stays on this device. The five captured images are encrypted when saved and used to confirm it is you at live check-in.</p>
-            </>}
-            {mode === 'login' && <div className="form-meta"><span>Secure access to your personal vault</span><span className="secure-label"><Icon name="lock" size={13} /> ENCRYPTED</span></div>}
-            {mode.endsWith('-login') && <div className="form-meta"><span>{mode === 'nominee-login' ? 'Case submission only; no document access' : mode === 'reviewer-login' ? 'Case review only; no document access' : 'Documents stay locked until approved release'}</span><span className="secure-label"><Icon name="lock" size={13} /> RESTRICTED</span></div>}
-            <button className="button button-primary button-full" type="submit" disabled={loading}>{loading ? 'Please wait...' : mode === 'register' ? 'Create secure account' : 'Sign in'}<Icon name="arrow" size={17} /></button>
+                  </>
+                )}
+                {mode !== 'register' && (
+                  <label>Email address<input name="email" type="email" placeholder="you@example.com" autoComplete="email" required /></label>
+                )}
+                <label>Password
+                  <span className="password-wrap">
+                    <input name="password" type={showPassword ? 'text' : 'password'} placeholder={mode === 'register' ? 'At least 10 characters' : 'Enter your password'} autoComplete={mode === 'register' ? 'new-password' : 'current-password'} required minLength={mode === 'register' ? 10 : 1} />
+                    <button type="button" className="password-toggle" onClick={() => setShowPassword(!showPassword)} aria-label={showPassword ? 'Hide password' : 'Show password'}><Icon name="eye" size={18} /></button>
+                  </span>
+                </label>
+                {mode === 'register' && (
+                  <>
+                    <label>Confirm password
+                      <span className="password-wrap">
+                        <input name="confirmPassword" type={showConfirm ? 'text' : 'password'} placeholder="Enter your password again" autoComplete="new-password" required minLength={10} />
+                        <button type="button" className="password-toggle" onClick={() => setShowConfirm(!showConfirm)} aria-label={showConfirm ? 'Hide password' : 'Show password'}><Icon name="eye" size={18} /></button>
+                      </span>
+                    </label>
+                    <div className="enrollment-card">
+                      <div className="enrollment-heading"><span className="mini-icon"><Icon name="scan" size={17} /></span><span><b>Face enrollment</b><small>Capture five face samples for your secure profile.</small></span><span className={`sample-count ${faceSamples.length === 5 ? 'sample-count-done' : ''}`}>{faceSamples.length}/5</span></div>
+                      <div className={`enrollment-camera ${cameraOpen ? 'enrollment-camera-active' : 'enrollment-camera-idle'}`}>
+                        <div className="enrollment-preview">
+                          <video className="enrollment-live-video" ref={videoRef} muted playsInline />
+                          {cameraOpen && <><div className="face-guide"><span>Center your face here</span></div><span className="camera-live-label"><span className="live-dot" /> LIVE PREVIEW</span></>}
+                        </div>
+                        {cameraOpen && <>
+                          <p className="camera-instructions">Look at the camera, keep your face inside the guide, and use even lighting. Five samples will be captured automatically.</p>
+                          <div className="button-row">
+                            <button type="button" className="button button-primary button-small" onClick={captureEnrollmentSamples} disabled={capturing}>{capturing ? `Capturing ${captureProgress}/5...` : 'Capture 5 samples'}</button>
+                            <button type="button" className="button button-quiet button-small" onClick={stopEnrollmentCamera} disabled={capturing}>Cancel</button>
+                          </div>
+                          {capturing && <div className="capture-progress" aria-label={`${captureProgress} of 5 samples captured`}><span style={{ width: `${captureProgress * 20}%` }} /></div>}
+                        </>}
+                      </div>
+                      {!cameraOpen && faceSamples.length < 5 && (
+                        <div className="enrollment-start">
+                          <p>{faceSamples.length ? `${faceSamples.length} of 5 captured. You can capture the remaining samples.` : 'Open the camera to see your live preview before taking samples.'}</p>
+                          <button type="button" className="button button-secondary button-small" onClick={openEnrollmentCamera}>Open camera</button>
+                        </div>
+                      )}
+                      {faceSamples.length > 0 && (
+                        <div className="sample-strip">
+                          {faceSamples.map((sample, index) => <div className="sample-thumb" key={`${index}-${sample.length}`}><img src={sample} alt={`Face enrollment sample ${index + 1}`} /><span>{String(index + 1).padStart(2, '0')}</span></div>)}
+                          {faceSamples.length === 5 && <button type="button" className="text-button recapture-button" onClick={() => { setFaceSamples([]); setCaptureProgress(0); openEnrollmentCamera() }}>Retake all</button>}
+                        </div>
+                      )}
+                    </div>
+                    <p className="field-hint">Your live preview stays on this device. The five captured images are encrypted when saved and used to confirm it is you at live check-in.</p>
+                  </>
+                )}
+                {mode === 'login' && (
+                  <div className="form-meta" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <button type="button" className="text-link" style={{ fontSize: '12px', background: 'none', border: 'none', padding: 0, cursor: 'pointer', color: 'var(--purple, #5c57d9)' }} onClick={() => { setMode('reset-request'); setError(''); setNotice('') }}>
+                      Forgot password?
+                    </button>
+                    <span className="secure-label"><Icon name="lock" size={13} /> ENCRYPTED</span>
+                  </div>
+                )}
+                {mode.endsWith('-login') && (
+                  <div className="form-meta">
+                    <span>{mode === 'nominee-login' ? 'Case submission only; no document access' : mode === 'reviewer-login' ? 'Case review only; no document access' : 'Documents stay locked until approved release'}</span>
+                    <span className="secure-label"><Icon name="lock" size={13} /> RESTRICTED</span>
+                  </div>
+                )}
+                <button className="button button-primary button-full" type="submit" disabled={loading}>
+                  {loading ? 'Please wait...' : mode === 'register' ? 'Create secure account' : 'Sign in'}<Icon name="arrow" size={17} />
+                </button>
+              </>
+            )}
           </form>
-          <p className="auth-switch">{mode === 'login' ? 'New to CloudGuard?' : mode === 'register' ? 'Already have a CloudGuard account?' : 'Use a different sign-in role?'} <button type="button" onClick={() => { setMode(mode === 'login' ? 'register' : 'login'); setError(''); setNotice('') }}>{mode === 'login' ? 'Create an account' : 'Owner sign in'}</button></p>
-          {mode !== 'register' && <div className="auth-role-links">
-            {mode !== 'recipient-login' && <p className="auth-switch">Authorized recipient? <button type="button" onClick={() => { setMode('recipient-login'); setError(''); setNotice('') }}>Recipient sign-in</button></p>}
-            {mode !== 'nominee-login' && <p className="auth-switch">Trusted nominee? <button type="button" onClick={() => { setMode('nominee-login'); setError(''); setNotice('') }}>Nominee sign-in</button></p>}
-            {mode !== 'reviewer-login' && <p className="auth-switch">Reviewer? <button type="button" onClick={() => { setMode('reviewer-login'); setError(''); setNotice('') }}>Reviewer sign-in</button></p>}
-          </div>}
+
+          {mode === 'reset-request' || mode === 'recovery' ? (
+            <p className="auth-switch">Remember your password? <button type="button" onClick={() => { setMode('login'); setError(''); setNotice('') }}>Back to sign in</button></p>
+          ) : (
+            <>
+              <p className="auth-switch">{mode === 'login' ? 'New to CloudGuard?' : mode === 'register' ? 'Already have a CloudGuard account?' : 'Use a different sign-in role?'} <button type="button" onClick={() => { setMode(mode === 'login' ? 'register' : 'login'); setError(''); setNotice('') }}>{mode === 'login' ? 'Create an account' : 'Owner sign in'}</button></p>
+              {mode !== 'register' && (
+                <div className="auth-role-links">
+                  {mode !== 'recipient-login' && <p className="auth-switch">Authorized recipient? <button type="button" onClick={() => { setMode('recipient-login'); setError(''); setNotice('') }}>Recipient sign-in</button></p>}
+                  {mode !== 'nominee-login' && <p className="auth-switch">Trusted nominee? <button type="button" onClick={() => { setMode('nominee-login'); setError(''); setNotice('') }}>Nominee sign-in</button></p>}
+                  {mode !== 'reviewer-login' && <p className="auth-switch">Reviewer? <button type="button" onClick={() => { setMode('reviewer-login'); setError(''); setNotice('') }}>Reviewer sign-in</button></p>}
+                </div>
+              )}
+            </>
+          )}
           <div className="auth-footnote"><Icon name="lock" size={13} /> Your files stay yours. Always.</div>
         </div>
         <div className="auth-bottom">CLOUDGUARD <span>•</span> A PRIVATE PLACE FOR WHAT MATTERS</div>
@@ -910,7 +1292,39 @@ function App() {
   const [pageData, setPageData] = useState({})
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
-  const invitationToken = new URLSearchParams(window.location.hash.slice(1)).get('guest-invitation')
+  const [invitationToken, setInvitationToken] = useState(() => {
+    return new URLSearchParams(window.location.hash.slice(1)).get('guest-invitation') || ''
+  })
+
+  useEffect(() => {
+    function handleHash() {
+      const token = new URLSearchParams(window.location.hash.slice(1)).get('guest-invitation') || ''
+      setInvitationToken(token)
+    }
+    window.addEventListener('hashchange', handleHash)
+    return () => window.removeEventListener('hashchange', handleHash)
+  }, [])
+
+  useEffect(() => {
+    if (!isSupabaseConfigured) return
+    const { data: { subscription } } = onSupabaseAuthStateChange(async (event, session) => {
+      if (event === 'SIGNED_OUT') {
+        localStorage.removeItem('cloudguard_token')
+        localStorage.removeItem('cloudguard_user')
+        setToken('')
+        setUser(null)
+      } else if (session?.access_token && event === 'TOKEN_REFRESHED') {
+        localStorage.setItem('cloudguard_token', session.access_token)
+        setToken(session.access_token)
+      }
+    })
+    return () => subscription?.unsubscribe()
+  }, [])
+
+  const clearInvitation = useCallback(() => {
+    window.history.replaceState(null, '', window.location.pathname)
+    setInvitationToken('')
+  }, [])
 
   const notify = useCallback((message) => {
     setToast(message)
@@ -922,8 +1336,24 @@ function App() {
     if (token) {
       try {
         await api('/auth/logout', { token, method: 'POST' })
+      } catch (logoutError) {
+        // Only flag as a meaningful failure when the server was reachable but refused
+        // (e.g. the session was already revoked by another party).
+        // Network/connection errors during logout are expected when the backend is
+        // restarting; those do not indicate a security problem.
+        const isNetworkError = logoutError?.message?.toLowerCase().includes('failed to fetch') ||
+          logoutError?.message?.toLowerCase().includes('network') ||
+          logoutError?.message?.toLowerCase().includes('connect')
+        if (!isNetworkError) {
+          revokeFailed = true
+        }
+      }
+    }
+    if (isSupabaseConfigured) {
+      try {
+        await signOutSupabase()
       } catch {
-        revokeFailed = true
+        // ignore client sign out errors
       }
     }
     localStorage.removeItem('cloudguard_token')
@@ -1034,9 +1464,11 @@ function App() {
     let revokeFailed = false
     try {
       await api('/recipient/logout', { token: recipientToken, method: 'POST' })
-    } catch {
-      revokeFailed = true
+    } catch (err) {
+      const isNetwork = err?.message?.toLowerCase().includes('failed to fetch') || err?.message?.toLowerCase().includes('network') || err?.message?.toLowerCase().includes('connect')
+      if (!isNetwork) revokeFailed = true
     }
+    if (isSupabaseConfigured) { try { await signOutSupabase() } catch { /* ignore */ } }
     sessionStorage.removeItem('cloudguard_recipient_token')
     setRecipientToken('')
     setAuthNotice(revokeFailed
@@ -1048,9 +1480,11 @@ function App() {
     let revokeFailed = false
     try {
       await api('/nominee/logout', { token: nomineeToken, method: 'POST' })
-    } catch {
-      revokeFailed = true
+    } catch (err) {
+      const isNetwork = err?.message?.toLowerCase().includes('failed to fetch') || err?.message?.toLowerCase().includes('network') || err?.message?.toLowerCase().includes('connect')
+      if (!isNetwork) revokeFailed = true
     }
+    if (isSupabaseConfigured) { try { await signOutSupabase() } catch { /* ignore */ } }
     sessionStorage.removeItem('cloudguard_nominee_token')
     setNomineeToken('')
     setAuthNotice(revokeFailed
@@ -1062,9 +1496,11 @@ function App() {
     let revokeFailed = false
     try {
       await api('/reviewer/logout', { token: reviewerToken, method: 'POST' })
-    } catch {
-      revokeFailed = true
+    } catch (err) {
+      const isNetwork = err?.message?.toLowerCase().includes('failed to fetch') || err?.message?.toLowerCase().includes('network') || err?.message?.toLowerCase().includes('connect')
+      if (!isNetwork) revokeFailed = true
     }
+    if (isSupabaseConfigured) { try { await signOutSupabase() } catch { /* ignore */ } }
     sessionStorage.removeItem('cloudguard_reviewer_token')
     setReviewerToken('')
     setAuthNotice(revokeFailed
@@ -1089,6 +1525,7 @@ function App() {
   }
 
   function handleInvitationClaim(response) {
+    clearInvitation()
     sessionStorage.removeItem('cloudguard_guest_token')
     sessionStorage.removeItem('cloudguard_recipient_token')
     sessionStorage.removeItem('cloudguard_nominee_token')
@@ -1099,6 +1536,8 @@ function App() {
     setReviewerToken('')
     localStorage.removeItem('cloudguard_token')
     localStorage.removeItem('cloudguard_user')
+    setToken('')
+    setUser(null)
     if (response.principal_type === 'recipient') {
       sessionStorage.setItem('cloudguard_recipient_token', response.access_token)
       setRecipientToken(response.access_token)
@@ -1109,7 +1548,6 @@ function App() {
       sessionStorage.setItem('cloudguard_guest_token', response.access_token)
       setGuestToken(response.access_token)
     }
-    window.history.replaceState(null, '', window.location.pathname)
   }
 
   async function guestSignOut() {
@@ -1122,7 +1560,13 @@ function App() {
   }
 
   if (invitationToken) {
-    return <GuestInvitationClaim invitationToken={invitationToken} onClaim={handleInvitationClaim} />
+    return (
+      <GuestInvitationClaim
+        invitationToken={invitationToken}
+        onClaim={handleInvitationClaim}
+        onCancel={clearInvitation}
+      />
+    )
   }
   if (guestToken) return <GuestSession token={guestToken} onSignOut={guestSignOut} />
   if (recipientToken) return <RecipientPortal token={recipientToken} onSignOut={recipientSignOut} />
@@ -1192,7 +1636,7 @@ function App() {
           {page === 'documents' && <Documents data={pageData.documents || []} token={token} onChange={load} />}
           {page === 'recipients' && <Recipients data={pageData.recipients || []} token={token} onChange={load} />}
           {page === 'nominee' && <Nominee data={pageData.nominee || null} token={token} onChange={load} />}
-          {page === 'checkin' && <Checkin token={token} onComplete={async (checkin) => { await load(); notify(checkin.status === 'success' ? 'Check-in passed.' : checkin.face_status !== 'passed' && (checkin.face_detail === 'different_person' || checkin.face_detail === 'mismatch') ? 'Check-in failed: the live face does not match enrollment.' : 'Check-in recorded. Verification did not pass.') }} />}
+          {page === 'checkin' && <Checkin token={token} onNavigate={navigate} onComplete={async (checkin) => { await load(); notify(checkin.status === 'success' ? 'Check-in passed.' : checkin.face_status !== 'passed' && (checkin.face_detail === 'different_person' || checkin.face_detail === 'mismatch') ? 'Check-in failed: the live face does not match enrollment.' : 'Check-in recorded. Verification did not pass.') }} />}
           {page === 'history' && <History data={pageData.checkins || []} />}
           {page === 'profile' && <Profile data={user} token={token} onSave={(updated) => { setUser(updated); localStorage.setItem('cloudguard_user', JSON.stringify(updated)); notify('Your profile has been updated.') }} />}
         </div>
@@ -1593,6 +2037,7 @@ function Recipients({ data, token, onChange }) {
 function InvitationControls({ role, targetId, token, invitations, onChange }) {
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState('')
+  const [messageType, setMessageType] = useState('')
   const [claimUrl, setClaimUrl] = useState('')
   const [copied, setCopied] = useState(false)
   const latest = invitations.find((item) => item.role === role && item.target_id === targetId)
@@ -1601,6 +2046,7 @@ function InvitationControls({ role, targetId, token, invitations, onChange }) {
   async function send() {
     setBusy(true)
     setMessage('')
+    setMessageType('')
     setClaimUrl('')
     setCopied(false)
     try {
@@ -1611,10 +2057,18 @@ function InvitationControls({ role, targetId, token, invitations, onChange }) {
       })
       const url = response.claim_url || response.invitation?.claim_url || ''
       setClaimUrl(url)
-      setMessage(response.message || response.invitation?.email_note || 'Invitation ready. Copy the link below.')
+      setMessage(response.message || 'Invitation email accepted by Resend.')
+      setMessageType('success')
       await onChange()
     } catch (requestError) {
-      setMessage(requestError.message)
+      setClaimUrl('')
+      setMessageType('error')
+      const msg = requestError.message || ''
+      if (msg.includes('configuration is missing') || msg.includes('503')) {
+        setMessage('Email sending is not configured on the server. Configure RESEND_API_KEY, RESEND_FROM_EMAIL, and CLOUDGUARD_APP_URL in backend/.env.')
+      } else {
+        setMessage(msg)
+      }
     } finally {
       setBusy(false)
     }
@@ -1624,13 +2078,16 @@ function InvitationControls({ role, targetId, token, invitations, onChange }) {
     if (!latest) return
     setBusy(true)
     setMessage('')
+    setMessageType('')
     setClaimUrl('')
     try {
       await api(`/invitations/${latest.id}`, { token, method: 'DELETE' })
       setMessage('Invitation revoked.')
+      setMessageType('success')
       await onChange()
     } catch (requestError) {
       setMessage(requestError.message)
+      setMessageType('error')
     } finally {
       setBusy(false)
     }
@@ -1649,27 +2106,78 @@ function InvitationControls({ role, targetId, token, invitations, onChange }) {
 
   return (
     <span className="invitation-controls">
-      {latest && <small>Invite: {latest.status}</small>}
+      {latest && (
+        <small className={`invitation-status status-${latest.status}`}>
+          Invite: <b>{latest.status}</b>
+        </small>
+      )}
       {canRevoke ? (
         <button type="button" className="text-button" onClick={revoke} disabled={busy}>
-          {busy ? 'Please wait...' : 'Revoke access'}
+          {busy ? 'Revoking access...' : 'Revoke access'}
         </button>
       ) : (
         <button type="button" className="text-button" onClick={send} disabled={busy}>
-          {busy ? 'Creating...' : latest ? 'Send new invitation' : 'Invite to CloudGuard'}
+          {busy
+            ? 'Sending invitation email...'
+            : latest?.status === 'failed'
+              ? 'Retry invitation email'
+              : latest
+                ? 'Resend invitation email'
+                : 'Send invitation email'}
         </button>
       )}
-      {message && <small role="status">{message}</small>}
+      {message && (
+        <small
+          className={`invitation-message ${messageType === 'error' ? 'notice-inline-error' : 'notice-inline-success'}`}
+          role={messageType === 'error' ? 'alert' : 'status'}
+          style={{
+            display: 'block',
+            width: '100%',
+            marginTop: '4px',
+            color: messageType === 'error' ? '#c0392b' : '#2e7d32',
+            fontWeight: 500,
+          }}
+        >
+          {messageType === 'error' ? '⚠ ' : '✓ '}
+          {message}
+        </small>
+      )}
       {claimUrl && (
-        <div className="invite-link-box" style={{ marginTop: '0.6rem', padding: '0.75rem', background: 'var(--surface-soft, #f6f5ff)', borderRadius: '10px', maxWidth: '100%' }}>
-          <small style={{ display: 'block', marginBottom: '0.35rem', fontWeight: 600 }}>
-            Invitation email sent. Share this link manually if needed.
+        <div
+          className="invite-link-box"
+          style={{
+            marginTop: '0.6rem',
+            padding: '0.75rem',
+            background: 'var(--surface-soft, #f6f5ff)',
+            borderRadius: '10px',
+            maxWidth: '100%',
+            border: '1px solid #e0defa',
+          }}
+        >
+          <small style={{ display: 'block', marginBottom: '0.35rem', fontWeight: 600, color: '#3e4353' }}>
+            Invitation email accepted by Resend. Backup link for manual sharing:
           </small>
-          <code style={{ display: 'block', wordBreak: 'break-all', fontSize: '12px', marginBottom: '0.5rem' }}>
+          <code
+            style={{
+              display: 'block',
+              wordBreak: 'break-all',
+              fontSize: '11px',
+              marginBottom: '0.5rem',
+              background: '#fff',
+              padding: '6px 8px',
+              borderRadius: '6px',
+              border: '1px solid #eef0f5',
+            }}
+          >
             {claimUrl}
           </code>
-          <button type="button" className="button button-primary" onClick={copyLink} style={{ fontSize: '13px', padding: '0.4rem 0.85rem' }}>
-            {copied ? 'Copied!' : 'Copy invitation link'}
+          <button
+            type="button"
+            className="button button-primary"
+            onClick={copyLink}
+            style={{ fontSize: '12px', minHeight: '30px', padding: '0.3rem 0.85rem' }}
+          >
+            {copied ? 'Copied!' : 'Copy backup link'}
           </button>
         </div>
       )}
@@ -1790,7 +2298,7 @@ function checkinResultCopy(result) {
   }
 }
 
-function Checkin({ token, onComplete }) {
+function Checkin({ token, onComplete, onNavigate }) {
   const videoRef = useRef(null)
   const streamRef = useRef(null)
   const recorderRef = useRef(null)
@@ -1928,7 +2436,12 @@ function Checkin({ token, onComplete }) {
           <div className={`checkin-step ${step === 'result' ? 'step-current' : ''}`}><span>04</span><div><b>Review your result</b><small>See whether verification passed.</small></div></div>
         </div>
         {['camera', 'recording', 'recorded'].includes(step) && <div className="checkin-phrase"><span className="eyebrow">READ THIS PHRASE ALOUD</span><p>"{sentence}"</p><small>Speak clearly and naturally while looking at the camera.</small></div>}
-        {error && <div className="notice notice-error">{error}</div>}
+        {error && <div className="notice notice-error">
+          <div>{error}</div>
+          {error.toLowerCase().includes('re-enroll') && <div style={{ marginTop: 8 }}>
+            <button type="button" className="button button-secondary button-small" onClick={() => onNavigate?.('profile')}>Go to Profile to re-enroll face <Icon name="arrow" size={14} /></button>
+          </div>}
+        </div>}
         {step === 'ready' && <div className="checkin-tips"><Icon name="shield" size={15} /><span><b>Tips for a successful check-in:</b><ul style={{margin:'6px 0 0 0',paddingLeft:'18px',fontSize:'0.85em'}}><li>Face the light source - good lighting is key.</li><li>Centre your face in the camera frame.</li><li>Speak the phrase clearly at a natural pace.</li><li>Use the same camera as during enrollment.</li></ul></span></div>}
         {step === 'ready' && <div className="checkin-privacy"><Icon name="lock" size={15} /><span>Your recording is sent to this server for verification, then deleted. Only the phrase and check results are saved.</span></div>}
         {step === 'ready' && <button className="button button-primary" onClick={openCamera}>Begin check-in <Icon name="arrow" size={17} /></button>}
@@ -1968,7 +2481,125 @@ function Profile({ data, token, onSave }) {
   const [saved, setSaved] = useState(false)
   const [loading, setLoading] = useState(false)
 
+  // Face enrollment state
+  const [faceSamples, setFaceSamples] = useState([])
+  const [cameraOpen, setCameraOpen] = useState(false)
+  const [capturing, setCapturing] = useState(false)
+  const [captureProgress, setCaptureProgress] = useState(0)
+  const [faceError, setFaceError] = useState('')
+  const [faceSaved, setFaceSaved] = useState(false)
+  const [faceLoading, setFaceLoading] = useState(false)
+  const videoRef = useRef(null)
+  const streamRef = useRef(null)
+  const cancelCaptureRef = useRef(false)
+
   useEffect(() => setForm({ name: data.name || '', phone: data.phone || '', checkin_interval: data.checkin_interval || 30 }), [data.name, data.phone, data.checkin_interval])
+
+  function stopEnrollmentCamera() {
+    cancelCaptureRef.current = true
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => track.stop())
+      streamRef.current = null
+    }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null
+    }
+    setCameraOpen(false)
+    setCapturing(false)
+  }
+
+  async function openEnrollmentCamera() {
+    setFaceError('')
+    setFaceSaved(false)
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setFaceError('Camera access needs a secure browser context (HTTPS or localhost).')
+      return
+    }
+    try {
+      stopEnrollmentCamera()
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: false,
+      })
+      streamRef.current = stream
+      const video = videoRef.current
+      if (!video) throw new Error('The camera preview could not be opened. Please try again.')
+      video.srcObject = stream
+      await video.play()
+      const deadline = Date.now() + 5000
+      while (!video.videoWidth && Date.now() < deadline) {
+        await new Promise((resolve) => window.setTimeout(resolve, 100))
+      }
+      if (!video.videoWidth) throw new Error('The camera did not start in time. Check browser permissions and try again.')
+      cancelCaptureRef.current = false
+      setCameraOpen(true)
+    } catch (cameraError) {
+      stopEnrollmentCamera()
+      setFaceError(cameraError instanceof Error && cameraError.name !== 'NotAllowedError'
+        ? cameraError.message
+        : 'Camera access is required. Allow camera permission in your browser and try again.')
+    }
+  }
+
+  async function captureEnrollmentSamples() {
+    const video = videoRef.current
+    if (!streamRef.current || !video?.videoWidth || capturing) {
+      setFaceError('Start the camera and wait for your live preview before capturing samples.')
+      return
+    }
+    setFaceError('')
+    cancelCaptureRef.current = false
+    setCapturing(true)
+    setCaptureProgress(0)
+    const samples = []
+    try {
+      for (let index = 0; index < 5; index += 1) {
+        if (cancelCaptureRef.current) return
+        await new Promise((resolve) => window.setTimeout(resolve, 700))
+        if (cancelCaptureRef.current || !videoRef.current?.videoWidth) return
+        const currentVideo = videoRef.current
+        const scale = Math.min(1, 720 / Math.max(currentVideo.videoWidth, currentVideo.videoHeight))
+        const canvas = document.createElement('canvas')
+        canvas.width = Math.round(currentVideo.videoWidth * scale)
+        canvas.height = Math.round(currentVideo.videoHeight * scale)
+        const context = canvas.getContext('2d')
+        if (!context) throw new Error('Could not capture the camera image. Please try again.')
+        context.drawImage(currentVideo, 0, 0, canvas.width, canvas.height)
+        samples.push(canvas.toDataURL('image/jpeg', 0.78))
+        setCaptureProgress(index + 1)
+        setFaceSamples([...samples])
+      }
+      stopEnrollmentCamera()
+    } catch (captureError) {
+      setFaceError(captureError.message || 'The camera sample could not be captured. Please try again.')
+    } finally {
+      setCapturing(false)
+    }
+  }
+
+  async function saveFaceEnrollment() {
+    if (faceSamples.length !== 5) {
+      setFaceError('Please capture all 5 face samples.')
+      return
+    }
+    setFaceLoading(true)
+    setFaceError('')
+    try {
+      await api('/profile/face-enrollment', {
+        token,
+        method: 'PUT',
+        body: JSON.stringify({
+          face_enrollment_samples_b64: faceSamples.map((sample) => sample.split(',')[1]),
+        }),
+      })
+      setFaceSaved(true)
+      setFaceSamples([])
+    } catch (requestError) {
+      setFaceError(requestError.message || 'Failed to update face enrollment.')
+    } finally {
+      setFaceLoading(false)
+    }
+  }
 
   async function submit(event) {
     event.preventDefault()
@@ -1998,6 +2629,41 @@ function Profile({ data, token, onSave }) {
         {error && <div className="notice notice-error">{error}</div>}{saved && <div className="notice notice-success">Your account details have been saved.</div>}
         <button type="submit" className="button button-primary" disabled={loading}>{loading ? 'Saving...' : 'Save changes'} <Icon name="arrow" size={16} /></button>
       </form>
+      <div className="profile-divider" style={{ margin: '24px 0' }} />
+      <div className="profile-form">
+        <div className="section-title-row"><div><span className="eyebrow">BIOMETRIC SECURITY</span><h3>Face enrollment</h3></div><span className="soft-tag">LIVE VERIFICATION</span></div>
+        <p className="surface-description">Your live check-in matches your face against five enrolled reference images. If you need to refresh or update your biometric enrollment, re-capture your samples below.</p>
+        <div className="enrollment-card">
+          <div className="enrollment-heading"><span className="mini-icon"><Icon name="scan" size={17} /></span><span><b>Biometric face enrollment</b><small>Capture five face samples for your account.</small></span><span className={`sample-count ${faceSamples.length === 5 ? 'sample-count-done' : ''}`}>{faceSamples.length}/5</span></div>
+          <div className={`enrollment-camera ${cameraOpen ? 'enrollment-camera-active' : 'enrollment-camera-idle'}`}>
+            <div className="enrollment-preview">
+              <video className="enrollment-live-video" ref={videoRef} muted playsInline />
+              {cameraOpen && <><div className="face-guide"><span>Center your face here</span></div><span className="camera-live-label"><span className="live-dot" /> LIVE PREVIEW</span></>}
+            </div>
+            {cameraOpen && <>
+              <p className="camera-instructions">Look at the camera, keep your face inside the guide, and use even lighting. Five samples will be captured automatically.</p>
+              <div className="button-row">
+                <button type="button" className="button button-primary button-small" onClick={captureEnrollmentSamples} disabled={capturing}>{capturing ? `Capturing ${captureProgress}/5...` : 'Capture 5 samples'}</button>
+                <button type="button" className="button button-quiet button-small" onClick={stopEnrollmentCamera} disabled={capturing}>Cancel</button>
+              </div>
+              {capturing && <div className="capture-progress" aria-label={`${captureProgress} of 5 samples captured`}><span style={{ width: `${captureProgress * 20}%` }} /></div>}
+            </>}
+          </div>
+          {!cameraOpen && faceSamples.length < 5 && <div className="enrollment-start">
+            <p>{faceSamples.length ? `${faceSamples.length} of 5 captured. You can capture the remaining samples.` : 'Open the camera to see your live preview before taking samples.'}</p>
+            <button type="button" className="button button-secondary button-small" onClick={openEnrollmentCamera}>Open camera</button>
+          </div>}
+          {faceSamples.length > 0 && <div className="sample-strip">
+            {faceSamples.map((sample, index) => <div className="sample-thumb" key={`${index}-${sample.length}`}><img src={sample} alt={`Face enrollment sample ${index + 1}`} /><span>{String(index + 1).padStart(2, '0')}</span></div>)}
+            {faceSamples.length === 5 && <div className="button-row" style={{ marginTop: 8 }}>
+              <button type="button" className="button button-primary button-small" onClick={saveFaceEnrollment} disabled={faceLoading}>{faceLoading ? 'Saving enrollment...' : 'Save new face enrollment'}</button>
+              <button type="button" className="text-button recapture-button" onClick={() => { setFaceSamples([]); setCaptureProgress(0); openEnrollmentCamera() }}>Retake all</button>
+            </div>}
+          </div>}
+          {faceError && <div className="notice notice-error">{faceError}</div>}
+          {faceSaved && <div className="notice notice-success">Face enrollment updated successfully. You can now complete your check-in.</div>}
+        </div>
+      </div>
     </section>
     <section className="surface security-info"><span className="security-info-icon"><Icon name="lock" size={19} /></span><div><b>Your security at a glance</b><p>Your password is stored using bcrypt. Documents and face enrollment images are encrypted at rest with AES-256-GCM. Your account token expires after 12 hours.</p></div><span className="soft-tag tag-secure">SECURE</span></section>
   </div>

@@ -72,6 +72,83 @@ Keep the hash private. The current prototype supports one separately configured 
 
 Owners can start and end a Medical Hold from the dashboard. While active or awaiting a fresh check-in, the API pauses new releases and blocks recipient downloads. Ending a hold moves it to `awaiting_checkin`; only a successful live check-in started after the hold ended resumes release eligibility. No escalation scheduler is implemented, and missed check-ins never release files.
 
+## Real Email Delivery with Resend
+
+CloudGuard uses the official [Resend](https://resend.com) API for transactional invitation delivery. When an owner invites a recipient or nominee, the backend validates authorization, generates an unpredictable 32-byte URL-safe invitation token, stores only its SHA-256 hash in the database, and dispatches a role-specific email with both formatted plain text and HTML.
+
+### 1. Environment Variables (`backend\.env`)
+
+| Variable | Description | Example |
+| :--- | :--- | :--- |
+| `RESEND_API_KEY` | Resend API key with sending permission (starts with `re_`) | `re_123456789_abcdef...` |
+| `RESEND_FROM_EMAIL` | Sender identity on a verified domain | `CloudGuard <invites@yourdomain.com>` |
+| `CLOUDGUARD_APP_URL` | Public frontend URL where invitation links will resolve | `http://localhost:5173` (local) or `https://app.yourdomain.com` |
+
+> [!NOTE]
+> Keep `backend\.env` private and never commit it to source control. It is ignored by `.gitignore`.
+
+### 2. Resend Dashboard & Domain Verification Steps
+
+To deliver emails to any recipient address, Resend requires domain verification:
+
+1. **Create an Account & API Key**:
+   - Sign in to [Resend Dashboard](https://resend.com).
+   - Go to **API Keys** &rarr; **Create API Key**. Select **Full Access** or **Sending Access**, copy the generated key (`re_...`), and set it as `RESEND_API_KEY` in `backend\.env`.
+2. **Add Your Custom Domain**:
+   - In the Resend dashboard, navigate to **Domains** &rarr; **Add Domain**.
+   - Enter your domain (e.g., `yourdomain.com` or `mail.yourdomain.com`).
+3. **Configure DNS Records**:
+   - Resend displays required DNS records:
+     - **DKIM** (CNAME / TXT records for cryptographic signing)
+     - **SPF** (TXT record permitting Resend servers to send on your domain's behalf)
+     - **DMARC** (TXT record at `_dmarc.yourdomain.com`)
+   - Add these records in your DNS provider (Cloudflare, Namecheap, Route 53, GoDaddy, etc.).
+4. **Verify Domain**:
+   - Click **Verify DNS Records** in Resend. Once verified, configure `RESEND_FROM_EMAIL` to use your domain (e.g., `CloudGuard <invites@yourdomain.com>`).
+5. **Testing on Resend Free / Unverified Tier**:
+   - If you do not yet have a custom domain, Resend provides the testing sender `onboarding@resend.dev`.
+   - On this tier, Resend **only permits sends to the single email address you used to register your Resend account**, or to `delivered@resend.dev` (a simulated delivery mailbox). Attempting to send to arbitrary addresses will be rejected with an HTTP 403 provider error until a custom domain is verified.
+
+### 3. Step-by-Step Instructions: Testing an Invitation End-to-End
+
+#### Step A: Verify Provider Connectivity via CLI
+Run the diagnostic script from the `backend` directory:
+```powershell
+cd C:\Major_Project\backend
+.\.venv\Scripts\python.exe test_resend_email.py [your-verified-email@example.com]
+```
+If successful, Resend will return a provider response ID (e.g., `{"id": "49a39f3b-..."}`).
+
+#### Step B: Test End-to-End via Web Application
+1. **Start the Application**:
+   ```powershell
+   cd C:\Major_Project
+   npm run dev
+   ```
+2. **Sign In as Owner**:
+   - Open `http://localhost:5173` in your browser.
+   - Log in or register an owner account (complete 5 face enrollment samples).
+3. **Add and Invite a Contact**:
+   - Go to **Trusted people** (or **Nominee**).
+   - Add a contact with the recipient's email address.
+   - Click **Send invitation email**.
+   - Notice the loading state (`Sending invitation email...`).
+   - When Resend accepts the request, the UI confirms with a green status message and provides a backup copy link. If the provider rejects the send, the UI surfaces the sanitized provider error.
+4. **Accept the Invitation**:
+   - Check the recipient's inbox. An email from CloudGuard will arrive containing:
+     - An explanation of the role (Authorized Recipient / Trusted Nominee)
+     - CloudGuard application URL
+     - Single-use acceptance link (`#guest-invitation=...`)
+     - Strict notice that accepting does not grant document access.
+   - Click the acceptance link, enter a password (at least 10 characters), and submit.
+   - The recipient is securely logged into their role-scoped portal.
+5. **Verify Security Boundary**:
+   - The recipient sees only assigned files in "pending" status. Downloads remain strictly blocked until:
+     1. Nominee submits death certificate evidence.
+     2. Reviewer approves the case in the Reviewer Portal.
+     3. Owner explicitly clicks "Approve release" for that document.
+     4. No Medical Hold is active.
+
 Resend must accept the message before CloudGuard reports an invitation as sent. Resend account and domain verification limits (including any trial-account recipient restrictions, sending quota, and rate limits) still apply; provider rejection leaves the invitation inactive and the owner must resolve the Resend configuration or quota issue before retrying.
 
 ## Encrypted document exports

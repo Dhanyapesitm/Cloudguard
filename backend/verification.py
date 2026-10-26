@@ -4,10 +4,18 @@ import logging
 import math
 import os
 import re
+import sys
 import threading
 import tempfile
 from functools import lru_cache
 from pathlib import Path
+
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 import numpy as np
 
@@ -15,8 +23,9 @@ _TRANSCRIBE_LOCK = threading.Lock()
 logger = logging.getLogger(__name__)
 
 FACE_MODEL = "Facenet"
-# OpenCV first: retinaface is too slow on CPU for a live check-in.
-FACE_DETECTORS = ("opencv", "ssd")
+# Detectors tested in order of availability and speed.
+# MTCNN and Retinaface provide accurate neural-network detection across OpenCV versions.
+FACE_DETECTORS = ("mtcnn", "retinaface", "opencv", "ssd")
 # DeepFace's Facenet cosine default is 0.40. Keep this tighter so a different
 # person cannot pass live check-in against the owner's enrollment photos.
 FACE_MATCH_MAX_DISTANCE = float(os.getenv("CLOUDGUARD_FACE_DISTANCE", "0.24"))
@@ -562,6 +571,11 @@ def verify_recording(
         return result
     except VerificationUnavailable:
         raise
+    except UnicodeError as exc:
+        logger.exception("Unicode encoding error in verification pipeline.")
+        raise VerificationUnavailable(
+            "Local verification encountered an encoding error. The check-in was not saved."
+        ) from exc
     except ValueError:
         raise
     except Exception as exc:
